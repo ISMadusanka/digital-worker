@@ -1,12 +1,14 @@
 """
-Preprocessor — converts raw Document AI output into a clean list of
+Preprocessor — converts raw OmniParser output into a clean list of
 UI elements suitable for LLM consumption.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from google.cloud import documentai
+import ast
+import re
+from dataclasses import dataclass
+from typing import Optional
 
 from utils.logger import get_logger
 
@@ -15,7 +17,7 @@ log = get_logger(__name__)
 
 @dataclass
 class UIElement:
-    """A single UI element extracted from OCR."""
+    """A single UI element extracted from OmniParser."""
 
     text: str
     center_x: int
@@ -25,7 +27,7 @@ class UIElement:
     width: int
     height: int
     confidence: float = 0.0
-    element_type: str = "unknown"  # button | display | label
+    element_type: str = "unknown"  # button | display | label | icon
 
     def to_dict(self) -> dict:
         return {
@@ -40,131 +42,57 @@ class UIElement:
         }
 
 
-def _extract_text_from_layout(
-    layout: documentai.Document.Page.Layout,
-    full_text: str,
-) -> str:
-    """Extract the text substring that a layout element refers to."""
-    text = ""
-    for segment in layout.text_anchor.text_segments:
-        start = int(segment.start_index)
-        end = int(segment.end_index)
-        text += full_text[start:end]
-    return text.strip()
+def _parse_icon_entry(line: str) -> Optional[dict]:
+    """Parse a single 'icon N: {...}' line from OmniParser's parsed_content_list.
 
-
-def _normalized_box_to_pixels(
-    vertices,
-    screen_width: int,
-    screen_height: int,
-) -> tuple[int, int, int, int]:
-    """Convert normalised vertices (0.0-1.0) to pixel coordinates.
-
-    Returns (x, y, width, height) in pixels.
+    Returns a dict with keys: type, bbox, interactivity, content, source.
+    Returns None if parsing fails.
     """
-    xs = [v.x for v in vertices]
-    ys = [v.y for v in vertices]
+    # Match pattern: "icon <number>: <dict>"
+    match = re.match(r"icon\s+\d+:\s*(.+)", line.strip())
+    if not match:
+        return None
 
-    x_min = int(min(xs) * screen_width)
-    y_min = int(min(ys) * screen_height)
-    x_max = int(max(xs) * screen_width)
-    y_max = int(max(ys) * screen_height)
+    dict_str = match.group(1)
+    try:
+        entry = ast.literal_eval(dict_str)
+        if isinstance(entry, dict):
+            return entry
+    except (ValueError, SyntaxError):
+        log.debug("Failed to parse icon entry: %s", line[:80])
 
-    return x_min, y_min, x_max - x_min, y_max - y_min
+    return None
 
 
-def _classify_element(text: str, width: int, height: int) -> str:
-    """Simple heuristic to classify a UI element type."""
-    stripped = text.strip()
+def _classify_omniparser_element(
+    content: str,
+    element_type: str,
+    interactivity: bool,
+    width: int,
+) -> str:
+    """Map OmniParser element attributes to a UI element type.
 
-    # Known calculator button labels — includes common OCR variants.
-    # 'x' and 'X' are how OCR often reads the multiplication sign '×'.
-    _BUTTON_LABELS = {
-        # Digits
-        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
-        # Basic operators (Unicode and ASCII variants)
-        "+", "-", "×", "÷", "=", ".", "%", "±", "√",
-        "*", "/", "x", "X",
-        # Parentheses and power
-        "(", ")", "^",
-        # Clear / delete
-        "C", "CE", "AC", "⌫", "DEL",
-        # Memory
-        "MC", "MR", "M+", "M-", "MS",
-        # Scientific extras OCR might pick up
-        "1/x", "x²", "x2", "π", "e",
-        "sin", "cos", "tan", "log", "ln",
-        "Exp", "Mod", "n!",
-    }
+    OmniParser provides 'type' ('text' or 'icon') and 'interactivity' (bool).
+    We map these to our element types:
+      - interactivity=True  → 'button'
+      - type='text' + not interactive + looks numeric + wide → 'display'
+      - type='text' + not interactive → 'label'
+      - type='icon' + not interactive → 'icon'
+    """
+    stripped = content.strip()
 
-    if stripped in _BUTTON_LABELS:
+    if interactivity:
         return "button"
 
-    # Longer numeric string — likely the display
-    if stripped.replace(",", "").replace(".", "").replace("-", "").isdigit():
-        if width > 100:
+    if element_type == "text":
+        # Check if it looks like a numeric display value
+        cleaned = stripped.replace(",", "").replace(".", "").replace("-", "").replace(" ", "")
+        if cleaned.isdigit() and width > 100:
             return "display"
-        return "button"
+        return "label"
 
-    # Short text that looks like a single UI control
-    if len(stripped) <= 3:
-        return "button"
-
-    # Everything else is a label
-    return "label"
-
-
-def _extract_elements_from_layout_items(
-    items,
-    full_text: str,
-    screen_width: int,
-    screen_height: int,
-    min_confidence: float,
-    min_text_length: int,
-) -> list[UIElement]:
-    """Shared helper: convert a list of Document AI layout items into UIElements."""
-    elements: list[UIElement] = []
-
-    for item in items:
-        text = _extract_text_from_layout(item.layout, full_text)
-
-        if len(text) < min_text_length:
-            continue
-
-        confidence = item.layout.confidence
-        if confidence < min_confidence:
-            continue
-
-        vertices = (
-            item.layout.bounding_poly.normalized_vertices
-            or item.layout.bounding_poly.vertices
-        )
-        if not vertices:
-            continue
-
-        x, y, w, h = _normalized_box_to_pixels(
-            vertices, screen_width, screen_height,
-        )
-
-        # Skip tiny artefacts
-        if w < 5 or h < 5:
-            continue
-
-        element_type = _classify_element(text, w, h)
-
-        elements.append(UIElement(
-            text=text,
-            center_x=x + w // 2,
-            center_y=y + h // 2,
-            x=x,
-            y=y,
-            width=w,
-            height=h,
-            confidence=confidence,
-            element_type=element_type,
-        ))
-
-    return elements
+    # type='icon' but not interactive
+    return "icon"
 
 
 def _deduplicate_elements(
@@ -173,14 +101,14 @@ def _deduplicate_elements(
 ) -> list[UIElement]:
     """Remove duplicate elements that refer to the same physical UI widget.
 
-    Document AI sometimes returns multiple overlapping tokens for the same
-    button (e.g. two '5' entries at nearly identical coordinates).  When the
-    LLM sees both, it may click the button twice.
+    OmniParser sometimes returns multiple overlapping detections for the same
+    element (e.g. from both OCR and YOLO).  When the LLM sees both, it may
+    click the button twice.
 
     Two elements are considered duplicates when they share the **same text**
     AND their bounding boxes overlap by at least *iou_threshold* (Intersection
-    over Union).  In each duplicate group only the element with the highest
-    confidence is kept.
+    over Union).  In each duplicate group only the first element encountered
+    is kept (OmniParser entries are already ordered by detection confidence).
     """
     if not elements:
         return elements
@@ -207,12 +135,9 @@ def _deduplicate_elements(
             return 0.0
         return inter_area / union_area
 
-    # Greedy de-duplication: sort by confidence (desc) so the best element
-    # in each cluster is kept.
-    sorted_elems = sorted(elements, key=lambda e: e.confidence, reverse=True)
     kept: list[UIElement] = []
 
-    for elem in sorted_elems:
+    for elem in elements:
         is_dup = False
         for existing in kept:
             if existing.text == elem.text and _iou(existing, elem) >= iou_threshold:
@@ -229,80 +154,90 @@ def _deduplicate_elements(
 
 
 def preprocess_ocr(
-    document: documentai.Document,
+    omniparser_result: dict,
     screen_width: int,
     screen_height: int,
-    min_confidence: float = 0.3,
     min_text_length: int = 1,
 ) -> list[UIElement]:
-    """Convert a Document AI response into a clean list of ``UIElement`` objects.
-
-    Processing strategy:
-      - Use **tokens** (word-level) as the primary source so that each
-        individual calculator button gets its own bounding box and click
-        coordinates.  Block-level extraction merges adjacent buttons
-        (e.g. "× ÷ - +") into a single element whose center falls on
-        dead space between buttons.
-      - Fall back to **blocks** only when a page has no tokens at all.
+    """Convert an OmniParser response into a clean list of ``UIElement`` objects.
 
     Args:
-        document: The Document AI proto returned by ``GoogleOCRService``.
+        omniparser_result: The dict returned by ``OmniParserService.process_image()``.
+            Must contain ``parsed_content_list`` (a newline-delimited string of
+            icon entries).
         screen_width: Screen width in pixels (for coordinate conversion).
         screen_height: Screen height in pixels.
-        min_confidence: Drop elements below this confidence score.
-        min_text_length: Drop elements with text shorter than this.
+        min_text_length: Drop elements with content shorter than this.
 
     Returns:
         Sorted list of ``UIElement`` instances (top-to-bottom, left-to-right).
     """
     elements: list[UIElement] = []
 
-    for page in document.pages:
-        # Collect tokens from all levels.  Document AI exposes
-        # page.tokens on newer processor versions.  For older ones
-        # that only populate paragraphs/lines/words, walk the tree.
-        tokens = getattr(page, "tokens", [])
+    content_list_str = omniparser_result.get("parsed_content_list", "")
+    if not content_list_str:
+        log.warning("OmniParser returned empty parsed_content_list")
+        return elements
 
-        if tokens:
-            # Finest granularity available — one element per visual token.
-            elements.extend(
-                _extract_elements_from_layout_items(
-                    tokens, document.text,
-                    screen_width, screen_height,
-                    min_confidence, min_text_length,
-                )
-            )
-        else:
-            # Try symbols → words → lines → paragraphs → blocks,
-            # preferring the finest granularity that has data.
-            finest = None
-            for attr in ("symbols", "words", "lines", "paragraphs", "blocks"):
-                candidates = getattr(page, attr, None)
-                if candidates:
-                    finest = candidates
-                    break
+    lines = content_list_str.strip().split("\n")
 
-            if finest is not None:
-                elements.extend(
-                    _extract_elements_from_layout_items(
-                        finest, document.text,
-                        screen_width, screen_height,
-                        min_confidence, min_text_length,
-                    )
-                )
+    for line in lines:
+        entry = _parse_icon_entry(line)
+        if entry is None:
+            continue
 
-    # De-duplicate overlapping elements (e.g. two OCR tokens for the same "5" button)
+        content = entry.get("content", "").strip()
+        if len(content) < min_text_length:
+            continue
+
+        bbox = entry.get("bbox")
+        if not bbox or len(bbox) != 4:
+            continue
+
+        # OmniParser bbox is [x_min, y_min, x_max, y_max] normalised (0.0–1.0)
+        x_min_norm, y_min_norm, x_max_norm, y_max_norm = bbox
+
+        x = int(x_min_norm * screen_width)
+        y = int(y_min_norm * screen_height)
+        w = int((x_max_norm - x_min_norm) * screen_width)
+        h = int((y_max_norm - y_min_norm) * screen_height)
+
+        # Skip tiny artefacts
+        if w < 5 or h < 5:
+            continue
+
+        element_type = _classify_omniparser_element(
+            content=content,
+            element_type=entry.get("type", "text"),
+            interactivity=entry.get("interactivity", False),
+            width=w,
+        )
+
+        elements.append(UIElement(
+            text=content,
+            center_x=x + w // 2,
+            center_y=y + h // 2,
+            x=x,
+            y=y,
+            width=w,
+            height=h,
+            confidence=1.0,  # OmniParser doesn't expose per-element confidence
+            element_type=element_type,
+        ))
+
+    # De-duplicate overlapping elements
     elements = _deduplicate_elements(elements)
 
     # Sort: top→bottom, then left→right
     elements.sort(key=lambda e: (e.y, e.x))
 
     log.info(
-        "Preprocessed %d UI elements (buttons=%d, displays=%d, labels=%d)",
+        "Preprocessed %d UI elements (buttons=%d, displays=%d, labels=%d, icons=%d)",
         len(elements),
         sum(1 for e in elements if e.element_type == "button"),
         sum(1 for e in elements if e.element_type == "display"),
         sum(1 for e in elements if e.element_type == "label"),
+        sum(1 for e in elements if e.element_type == "icon"),
     )
     return elements
 

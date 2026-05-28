@@ -5,7 +5,7 @@ Main orchestrator unifying services, agents, and execution.
 import uuid
 
 from services.screenshot import ScreenshotService
-from services.ocr import GoogleOCRService
+from services.ocr import OmniParserService
 from services.preprocessor import preprocess_ocr, format_elements_for_llm
 from services.verifier import ActionVerificationService
 from agent.planner import AgentPlanner
@@ -23,7 +23,7 @@ class DigitalWorker:
     def __init__(self) -> None:
         log.info("Starting up Digital Worker components...")
         self.screenshot = ScreenshotService()
-        self.ocr = GoogleOCRService()
+        self.ocr = OmniParserService()
         self.verifier = ActionVerificationService()
         self.agent = AgentPlanner()
         self.loop = ActionVerificationLoop(self)
@@ -44,18 +44,18 @@ class DigitalWorker:
         log.info("Digital Worker ready. Session: %s", self.session_id)
 
     def observe(self) -> str:
-        """Capture screen, run OCR, and format UI elements as text."""
+        """Capture screen, run OmniParser, and format UI elements as text."""
         log.info("Observing screen state...")
         
         # 1. Capture
         png_bytes = self.screenshot.capture_full_screen()
         
-        # 2. Extract Document data
-        document = self.ocr.process_image(png_bytes)
+        # 2. Send to OmniParser
+        omniparser_result = self.ocr.process_image(png_bytes)
         
         # 3. Preprocess to UI elements
         elements = preprocess_ocr(
-            document=document,
+            omniparser_result=omniparser_result,
             screen_width=self.screen_width,
             screen_height=self.screen_height,
         )

@@ -59,7 +59,7 @@ class AgentPlanner:
             # fresh UI state.  Higher values (e.g. 10) allowed 2 tool calls
             # per invocation, causing stale-state bugs (e.g. re-typing a
             # URL character instead of pressing Enter).
-            "recursion_limit": 6,
+            "recursion_limit": 12,
         }
         
         response = self.agent.invoke(
