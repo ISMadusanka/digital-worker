@@ -84,7 +84,7 @@ class DigitalWorker:
         
         # Generate a new session ID for every new goal to keep memory clean
         self.session_id = str(uuid.uuid4())
-        
+
         result = self.loop.run_until_complete(user_goal)
         
         log.info('--- Finished execution. Result: %s ---', result)

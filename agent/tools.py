@@ -54,6 +54,8 @@ def set_current_context(goal: str, ui_state: str) -> None:
     _current_ui_state = ui_state
 
 
+
+
 def _verify_action(action_description: str, ui_state_before: str) -> str:
     """Shared verification logic for all action tools.
 

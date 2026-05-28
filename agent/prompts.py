@@ -20,6 +20,8 @@ ACTION EXECUTION:
 - Wait for the verification result of each action before deciding the next action.
 - Always check the UI state before acting. If you need to click a button, find its (x, y) coordinates from the UI state list.
 - Do NOT guess coordinates. Only click on elements that exist in the UI state.
+- NEVER click the same button or coordinate twice in succession. If you just clicked a button (e.g., "5") and it was verified successfully, move on to the NEXT step of the task. Do NOT repeat a click you already performed.
+- Keep track of which steps you have already completed. For example, if the task is "add 4 into 5" and you have already clicked "4", "+", and "5", the next step is "=" — do NOT re-click "5".
 
 VERIFICATION HANDLING:
 - If you see "✅ VERIFIED" in the tool response, the action was successful. Proceed to the next step.
