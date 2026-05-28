@@ -1,5 +1,7 @@
 """
 Executes physical actions (mouse clicks, keyboard typing) via PyAutoGUI.
+
+Includes undo capabilities for correcting failed actions.
 """
 
 import time
@@ -65,3 +67,16 @@ class ActionExecutor:
             return "Failed: Mouse moved to a corner triggering fail-safe."
         except Exception as e:
             return f"Failed to press key '{key}': {e}"
+
+    def undo(self) -> str:
+        """Send Ctrl+Z to undo the last action in the active application."""
+        log.info("Executing undo (Ctrl+Z)")
+        try:
+            pyautogui.hotkey("ctrl", "z")
+            time.sleep(0.3)  # Brief pause to let the undo take effect
+            return "Successfully sent Ctrl+Z (undo)"
+        except pyautogui.FailSafeException:
+            return "Failed: Mouse moved to a corner triggering fail-safe."
+        except Exception as e:
+            log.error("Undo failed: %s", e)
+            return f"Failed to undo: {e}"

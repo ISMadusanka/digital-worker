@@ -7,8 +7,11 @@ import uuid
 from services.screenshot import ScreenshotService
 from services.ocr import GoogleOCRService
 from services.preprocessor import preprocess_ocr, format_elements_for_llm
+from services.verifier import ActionVerificationService
 from agent.planner import AgentPlanner
+from agent.tools import configure_tools, set_current_context
 from core.loop import ActionVerificationLoop
+from config import settings
 from utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -21,6 +24,7 @@ class DigitalWorker:
         log.info("Starting up Digital Worker components...")
         self.screenshot = ScreenshotService()
         self.ocr = GoogleOCRService()
+        self.verifier = ActionVerificationService()
         self.agent = AgentPlanner()
         self.loop = ActionVerificationLoop(self)
         
@@ -28,6 +32,15 @@ class DigitalWorker:
         self.screen_width, self.screen_height = self.screenshot.get_screen_size()
         
         self.session_id = str(uuid.uuid4())
+        
+        # Wire up the tools with observation and verification callbacks
+        # so they can capture post-action UI state and run verification
+        # without circular imports.
+        configure_tools(
+            observe_fn=self.observe,
+            verify_fn=self.verifier.verify,
+        )
+        
         log.info("Digital Worker ready. Session: %s", self.session_id)
 
     def observe(self) -> str:
@@ -55,6 +68,10 @@ class DigitalWorker:
         """Pass the goal and current state to the LangChain agent.
         The agent will automatically call tools if needed.
         """
+        # Update the tools module with current context so that
+        # verification callbacks know the current goal and UI state.
+        set_current_context(goal=goal, ui_state=ui_state)
+        
         return self.agent.plan_and_act(
             goal=goal,
             ui_state=ui_state,

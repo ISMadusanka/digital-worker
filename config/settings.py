@@ -41,6 +41,12 @@ ACTION_PAUSE: float = float(os.getenv("ACTION_PAUSE", "0.3"))
 MOUSE_MOVE_DURATION: float = float(os.getenv("MOUSE_MOVE_DURATION", "0.3"))
 
 # ---------------------------------------------------------------------------
+# Per-Action Verification
+# ---------------------------------------------------------------------------
+VERIFY_AFTER_ACTION: bool = os.getenv("VERIFY_AFTER_ACTION", "true").lower() in ("true", "1", "yes")
+VERIFICATION_DELAY: float = float(os.getenv("VERIFICATION_DELAY", "1.0"))
+
+# ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 SCREENSHOTS_DIR: Path = _project_root / "screenshots"
