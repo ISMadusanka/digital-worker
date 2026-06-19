@@ -49,7 +49,18 @@ class AgentPlanner:
         
         user_message = f"Current Goal: {goal}\n\nCurrent UI State:\n{ui_state}\n\nWhat is your next action?"
         
-        config = {"configurable": {"thread_id": session_id}}
+        config = {
+            "configurable": {"thread_id": session_id},
+            # Cap the agent's internal loop to prevent runaway tool-calling.
+            # A single tool-call cycle (agent → tools → agent) uses ~4-5
+            # graph steps in LangGraph.  A limit of 6 enforces exactly ONE
+            # tool call per invocation — the agent must return to the outer
+            # observe loop before acting again, ensuring it always sees
+            # fresh UI state.  Higher values (e.g. 10) allowed 2 tool calls
+            # per invocation, causing stale-state bugs (e.g. re-typing a
+            # URL character instead of pressing Enter).
+            "recursion_limit": 12,
+        }
         
         response = self.agent.invoke(
             {"messages": [("user", user_message)]},
