@@ -16,6 +16,9 @@ log = get_logger(__name__)
 
 class ScreenshotService:
     """Captures screenshots of the full screen or a specific region."""
+    
+    on_before_screenshot = None
+    on_after_screenshot = None
 
     def __init__(self, save_debug: bool = True) -> None:
         self._save_debug = save_debug
@@ -29,7 +32,16 @@ class ScreenshotService:
         """
         time.sleep(settings.SCREENSHOT_DELAY)
 
-        screenshot = pyautogui.screenshot()
+        if ScreenshotService.on_before_screenshot:
+            ScreenshotService.on_before_screenshot()
+            time.sleep(0.1) # brief pause to allow UI to hide
+
+        try:
+            screenshot = pyautogui.screenshot()
+        finally:
+            if ScreenshotService.on_after_screenshot:
+                ScreenshotService.on_after_screenshot()
+
         buffer = io.BytesIO()
         screenshot.save(buffer, format="PNG")
         png_bytes = buffer.getvalue()
@@ -51,7 +63,16 @@ class ScreenshotService:
         """
         time.sleep(settings.SCREENSHOT_DELAY)
 
-        screenshot = pyautogui.screenshot(region=(x, y, width, height))
+        if ScreenshotService.on_before_screenshot:
+            ScreenshotService.on_before_screenshot()
+            time.sleep(0.1) # brief pause to allow UI to hide
+
+        try:
+            screenshot = pyautogui.screenshot(region=(x, y, width, height))
+        finally:
+            if ScreenshotService.on_after_screenshot:
+                ScreenshotService.on_after_screenshot()
+
         buffer = io.BytesIO()
         screenshot.save(buffer, format="PNG")
         png_bytes = buffer.getvalue()
