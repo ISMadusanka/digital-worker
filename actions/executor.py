@@ -19,47 +19,66 @@ pyautogui.FAILSAFE = True
 pyautogui.PAUSE = settings.ACTION_PAUSE
 
 
+import contextlib
+
 class ActionExecutor:
     """Wrapper around PyAutoGUI to execute agent actions securely on Windows 11."""
+
+    on_before_action = None
+    on_after_action = None
+
+    @contextlib.contextmanager
+    def _action_context(self):
+        if ActionExecutor.on_before_action:
+            ActionExecutor.on_before_action()
+            time.sleep(0.1)
+        try:
+            yield
+        finally:
+            if ActionExecutor.on_after_action:
+                ActionExecutor.on_after_action()
 
     def click(self, x: int, y: int) -> str:
         """Move the mouse to (x,y) and click."""
         log.info("Executing click at (%d, %d)", x, y)
-        try:
-            pyautogui.moveTo(x, y, duration=settings.MOUSE_MOVE_DURATION, tween=pyautogui.easeInOutQuad)
-            pyautogui.click()
-            return f"Successfully clicked at ({x}, {y})"
-        except pyautogui.FailSafeException:
-            log.warning("Fail-safe triggered during click!")
-            return "Failed: Mouse moved to a corner triggering fail-safe."
-        except Exception as e:
-            log.error("Click failed: %s", e)
-            return f"Failed to click at ({x}, {y}): {e}"
+        with self._action_context():
+            try:
+                pyautogui.moveTo(x, y, duration=settings.MOUSE_MOVE_DURATION, tween=pyautogui.easeInOutQuad)
+                pyautogui.click()
+                return f"Successfully clicked at ({x}, {y})"
+            except pyautogui.FailSafeException:
+                log.warning("Fail-safe triggered during click!")
+                return "Failed: Mouse moved to a corner triggering fail-safe."
+            except Exception as e:
+                log.error("Click failed: %s", e)
+                return f"Failed to click at ({x}, {y}): {e}"
 
     def double_click(self, x: int, y: int) -> str:
         """Move the mouse to (x,y) and double click."""
         log.info("Executing double-click at (%d, %d)", x, y)
-        try:
-            pyautogui.moveTo(x, y, duration=settings.MOUSE_MOVE_DURATION, tween=pyautogui.easeInOutQuad)
-            pyautogui.doubleClick()
-            return f"Successfully double-clicked at ({x}, {y})"
-        except pyautogui.FailSafeException:
-            return "Failed: Mouse moved to a corner triggering fail-safe."
-        except Exception as e:
-            return f"Failed to double-click at ({x}, {y}): {e}"
+        with self._action_context():
+            try:
+                pyautogui.moveTo(x, y, duration=settings.MOUSE_MOVE_DURATION, tween=pyautogui.easeInOutQuad)
+                pyautogui.doubleClick()
+                return f"Successfully double-clicked at ({x}, {y})"
+            except pyautogui.FailSafeException:
+                return "Failed: Mouse moved to a corner triggering fail-safe."
+            except Exception as e:
+                return f"Failed to double-click at ({x}, {y}): {e}"
 
     def right_click(self, x: int, y: int) -> str:
         """Move the mouse to (x,y) and right-click to open context menu."""
         log.info("Executing right-click at (%d, %d)", x, y)
-        try:
-            pyautogui.moveTo(x, y, duration=settings.MOUSE_MOVE_DURATION, tween=pyautogui.easeInOutQuad)
-            pyautogui.rightClick()
-            return f"Successfully right-clicked at ({x}, {y})"
-        except pyautogui.FailSafeException:
-            return "Failed: Mouse moved to a corner triggering fail-safe."
-        except Exception as e:
-            log.error("Right-click failed: %s", e)
-            return f"Failed to right-click at ({x}, {y}): {e}"
+        with self._action_context():
+            try:
+                pyautogui.moveTo(x, y, duration=settings.MOUSE_MOVE_DURATION, tween=pyautogui.easeInOutQuad)
+                pyautogui.rightClick()
+                return f"Successfully right-clicked at ({x}, {y})"
+            except pyautogui.FailSafeException:
+                return "Failed: Mouse moved to a corner triggering fail-safe."
+            except Exception as e:
+                log.error("Right-click failed: %s", e)
+                return f"Failed to right-click at ({x}, {y}): {e}"
 
     def type_text(self, text: str, press_enter: bool = False) -> str:
         """Type a string of text via the keyboard."""
@@ -110,32 +129,34 @@ class ActionExecutor:
         """
         direction = "up" if clicks > 0 else "down"
         log.info("Scrolling %s (%d clicks) at (%s, %s)", direction, abs(clicks), x, y)
-        try:
-            if x is not None and y is not None:
-                pyautogui.moveTo(x, y, duration=settings.MOUSE_MOVE_DURATION)
-            pyautogui.scroll(clicks)
-            pos_info = f" at ({x}, {y})" if x is not None else ""
-            return f"Successfully scrolled {direction} {abs(clicks)} clicks{pos_info}"
-        except pyautogui.FailSafeException:
-            return "Failed: Mouse moved to a corner triggering fail-safe."
-        except Exception as e:
-            log.error("Scroll failed: %s", e)
-            return f"Failed to scroll: {e}"
+        with self._action_context():
+            try:
+                if x is not None and y is not None:
+                    pyautogui.moveTo(x, y, duration=settings.MOUSE_MOVE_DURATION)
+                pyautogui.scroll(clicks)
+                pos_info = f" at ({x}, {y})" if x is not None else ""
+                return f"Successfully scrolled {direction} {abs(clicks)} clicks{pos_info}"
+            except pyautogui.FailSafeException:
+                return "Failed: Mouse moved to a corner triggering fail-safe."
+            except Exception as e:
+                log.error("Scroll failed: %s", e)
+                return f"Failed to scroll: {e}"
 
     def drag(self, start_x: int, start_y: int, end_x: int, end_y: int) -> str:
         """Drag from one position to another (click and hold, then release)."""
         log.info("Dragging from (%d, %d) to (%d, %d)", start_x, start_y, end_x, end_y)
-        try:
-            pyautogui.moveTo(start_x, start_y, duration=settings.MOUSE_MOVE_DURATION)
-            pyautogui.mouseDown()
-            pyautogui.moveTo(end_x, end_y, duration=settings.MOUSE_MOVE_DURATION * 2)
-            pyautogui.mouseUp()
-            return f"Successfully dragged from ({start_x}, {start_y}) to ({end_x}, {end_y})"
-        except pyautogui.FailSafeException:
-            return "Failed: Mouse moved to a corner triggering fail-safe."
-        except Exception as e:
-            log.error("Drag failed: %s", e)
-            return f"Failed to drag: {e}"
+        with self._action_context():
+            try:
+                pyautogui.moveTo(start_x, start_y, duration=settings.MOUSE_MOVE_DURATION)
+                pyautogui.mouseDown()
+                pyautogui.moveTo(end_x, end_y, duration=settings.MOUSE_MOVE_DURATION * 2)
+                pyautogui.mouseUp()
+                return f"Successfully dragged from ({start_x}, {start_y}) to ({end_x}, {end_y})"
+            except pyautogui.FailSafeException:
+                return "Failed: Mouse moved to a corner triggering fail-safe."
+            except Exception as e:
+                log.error("Drag failed: %s", e)
+                return f"Failed to drag: {e}"
 
     def run_shell_command(self, command: str, timeout: int = 30) -> str:
         """Execute a PowerShell command on Windows 11 and return its output.

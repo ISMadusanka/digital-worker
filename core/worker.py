@@ -20,7 +20,9 @@ log = get_logger(__name__)
 class DigitalWorker:
     """Orchestrates perception, reasoning, and action."""
 
-    def __init__(self) -> None:
+    def __init__(self, on_step_callback=None) -> None:
+        self.on_step_callback = on_step_callback
+        self.stop_requested = False
         log.info("Starting up Digital Worker components...")
         self.screenshot = ScreenshotService()
         self.ocr = OmniParserService()
@@ -78,8 +80,15 @@ class DigitalWorker:
             session_id=self.session_id
         )
 
+    def emit_step(self, message: str) -> None:
+        """Emit a step update to the UI callback."""
+        if self.on_step_callback:
+            self.on_step_callback(message)
+
     def execute_goal(self, user_goal: str) -> str:
         """Main entry point to fulfill a user request."""
+        self.stop_requested = False
+        self.emit_step(f"Starting goal: {user_goal}")
         log.info('--- Starting execution for goal: "%s" ---', user_goal)
         
         # Generate a new session ID for every new goal to keep memory clean
@@ -87,5 +96,6 @@ class DigitalWorker:
 
         result = self.loop.run_until_complete(user_goal)
         
+        self.emit_step(f"Finished: {result}")
         log.info('--- Finished execution. Result: %s ---', result)
         return result

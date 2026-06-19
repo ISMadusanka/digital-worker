@@ -33,10 +33,20 @@ class ActionVerificationLoop:
         consecutive_failures = 0
         
         while iteration <= settings.MAX_AGENT_ITERATIONS:
+            if self.worker.stop_requested:
+                log.info("Execution stopped by user.")
+                return "Execution stopped by user."
+
             log.info("=== Loop Iteration %d ===", iteration)
+            self.worker.emit_step("Observing screen...")
             
             # 1. Observe (Screenshot + OCR + Preprocess)
             ui_state = self.worker.observe()
+            
+            if self.worker.stop_requested:
+                return "Execution stopped by user."
+
+            self.worker.emit_step("Planning next action...")
             
             # 2. Plan and Act (Agent decides ONE action and calls a tool)
             #    The tool internally captures after-state and runs verification.
@@ -74,9 +84,11 @@ class ActionVerificationLoop:
             # In a standard setup, if the agent doesn't call a tool, it returns text to the user.
             if "complete" in agent_output.lower() or "achieved" in agent_output.lower() or "finished" in agent_output.lower():
                 log.info("Goal achieved according to agent!")
+                self.worker.emit_step("Goal achieved!")
                 return f"Success after {iteration} iterations: {agent_output}"
                 
             log.info("Agent output this iteration: %s", agent_output)
+            self.worker.emit_step(f"Agent says: {agent_output}")
             
             # The agent called a tool (or multiple) as part of `reason_and_act`.
             # LangChain's AgentExecutor handles the immediate loop of tool calling,
