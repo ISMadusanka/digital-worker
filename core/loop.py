@@ -63,6 +63,9 @@ class ActionVerificationLoop:
                 iteration += 1
                 continue
 
+            if self.worker.stop_requested:
+                return "Execution stopped by user."
+
             results = response.get("results", [])
             agent_text = response.get("text", "") or ""
             last_action_summary = (results[0] if results else agent_text).strip()

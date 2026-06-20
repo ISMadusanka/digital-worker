@@ -51,8 +51,14 @@ class DigitalWorker:
         self, goal: str, perception: Perception, plan: str, history: str, iteration: int
     ) -> dict:
         """Pass the goal + current screen to the agent so it can act."""
-        # Expose the current goal/elements to the tools (for id->coord resolution).
-        set_current_context(goal=goal, ui_state=perception.text, elements=perception.elements)
+        # Expose current goal/elements/scale to the tools (for id->coord resolution
+        # and scaling of any raw fallback coordinates off the downscaled image).
+        set_current_context(
+            goal=goal,
+            ui_state=perception.text,
+            elements=perception.elements,
+            image_scale=perception.image_scale,
+        )
 
         return self.agent.plan_and_act(
             goal=goal,
@@ -62,6 +68,7 @@ class DigitalWorker:
             history=history,
             iteration=iteration,
             session_id=self.session_id,
+            should_run=lambda: not self.stop_requested,
         )
 
     def emit_step(self, message: str) -> None:

@@ -14,7 +14,6 @@ Backend selection (``PERCEPTION_BACKEND``):
 
 from __future__ import annotations
 
-import base64
 from dataclasses import dataclass, field
 
 from config import settings
@@ -22,7 +21,7 @@ from services.screenshot import ScreenshotService
 from services.uia import UIAutomationService
 from services.preprocessor import (
     UIElement,
-    annotate_screenshot,
+    build_vision_image,
     format_elements_for_llm,
     preprocess_ocr,
 )
@@ -37,7 +36,8 @@ class Perception:
 
     elements: list[UIElement] = field(default_factory=list)
     text: str = ""
-    image_b64: str | None = None  # base64 PNG of the annotated screenshot
+    image_b64: str | None = None  # base64 JPEG of the annotated screenshot
+    image_scale: float = 1.0      # downscale factor applied to the vision image
 
     def element_at(self, element_id: int) -> UIElement | None:
         if 0 <= element_id < len(self.elements):
@@ -84,22 +84,35 @@ class PerceptionService:
         The overlay UI is hidden for the whole pass so it appears in neither the
         screenshot nor the UI Automation tree.
         """
+        # A screenshot is only needed if we send vision to the model or the
+        # OmniParser backend requires the pixels. For the default text-only UIA
+        # path we skip capture entirely — faster, and no image touches the LLM.
+        need_image = settings.USE_VISION or self.backend in ("omniparser", "hybrid")
+
         with self.screenshot.hidden():
-            png_bytes = self.screenshot.capture_full_screen(manage_visibility=False)
+            png_bytes = (
+                self.screenshot.capture_full_screen(manage_visibility=False)
+                if need_image
+                else None
+            )
             elements = self._detect_elements(png_bytes)
 
         text = format_elements_for_llm(elements)
 
         image_b64: str | None = None
-        if settings.USE_VISION:
-            img = (
-                annotate_screenshot(png_bytes, elements)
-                if settings.SET_OF_MARK
-                else png_bytes
+        image_scale = 1.0
+        if settings.USE_VISION and png_bytes is not None:
+            image_b64, image_scale = build_vision_image(
+                png_bytes,
+                elements,
+                max_width=settings.VISION_MAX_WIDTH,
+                quality=settings.VISION_JPEG_QUALITY,
+                set_of_mark=settings.SET_OF_MARK,
             )
-            image_b64 = base64.b64encode(img).decode("ascii")
 
-        return Perception(elements=elements, text=text, image_b64=image_b64)
+        return Perception(
+            elements=elements, text=text, image_b64=image_b64, image_scale=image_scale
+        )
 
     def read_active_window_text(self, max_chars: int = 6000) -> str:
         """Read the text content of the foreground window (UIA only)."""

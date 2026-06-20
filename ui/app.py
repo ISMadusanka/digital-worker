@@ -18,17 +18,26 @@ class WorkerThread(QThread):
     def __init__(self, goal: str):
         super().__init__()
         self.goal = goal
-        self.worker = DigitalWorker(on_step_callback=self.step_signal.emit)
-        
+        self.worker = None
+        self._stop_requested = False
+
     def run(self):
         try:
+            # Build the worker HERE so its heavy startup (model client) and the
+            # UI Automation / COM initialization happen on this worker thread —
+            # not on the GUI thread (no launch freeze) and on the same thread
+            # that later drives UIA.
+            self.worker = DigitalWorker(on_step_callback=self.step_signal.emit)
+            if self._stop_requested:
+                self.worker.stop_requested = True
             result = self.worker.execute_goal(self.goal)
             self.finished_signal.emit(result)
         except Exception as e:
             self.finished_signal.emit(f"Error: {str(e)}")
-            
+
     def stop(self):
-        if hasattr(self, 'worker'):
+        self._stop_requested = True
+        if self.worker is not None:
             self.worker.stop_requested = True
 
 class DigitalWorkerUI(QWidget):
@@ -38,6 +47,7 @@ class DigitalWorkerUI(QWidget):
     def __init__(self):
         super().__init__()
         self.worker_thread = None
+        self._pending_quit = False
         self.init_ui()
         self.setup_hooks()
         
@@ -144,7 +154,7 @@ class DigitalWorkerUI(QWidget):
             }
             QPushButton:hover { color: white; }
         """)
-        self.close_btn.clicked.connect(QApplication.quit)
+        self.close_btn.clicked.connect(self.shutdown)
         
         self.expanded_layout.addWidget(self.chat_history)
         self.expanded_layout.addLayout(self.input_layout)
@@ -253,9 +263,55 @@ class DigitalWorkerUI(QWidget):
         
     def on_worker_finished(self, result: str):
         self.chat_history.append(f"<b>Result:</b> {result}<br><br>")
+        if self._pending_quit:
+            QApplication.quit()
+            return
         self.set_expanded_mode()
 
+    def shutdown(self):
+        """Stop the worker (if running) and quit cleanly.
+
+        We do NOT block the GUI thread waiting for the worker, because the worker
+        hides/shows this window via a blocking queued signal — blocking here would
+        deadlock. Instead we request a stop and quit once the worker reports back.
+        """
+        if self.worker_thread and self.worker_thread.isRunning():
+            self._pending_quit = True
+            self.status_label.setText("Stopping…")
+            self.worker_thread.stop()
+        else:
+            QApplication.quit()
+
+    def closeEvent(self, event):
+        # Alt+F4 / window close: stop the worker first, then let it quit.
+        if self.worker_thread and self.worker_thread.isRunning():
+            self.shutdown()
+            event.ignore()
+        else:
+            event.accept()
+            QApplication.quit()
+
+def _enable_dpi_awareness():
+    """Make the process per-monitor DPI aware BEFORE Qt starts.
+
+    This keeps screenshots, UI Automation bounding boxes, and PyAutoGUI click
+    coordinates all in the same (physical-pixel) space on scaled displays, and
+    silences Qt's DPI-context warning.
+    """
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        user32.SetProcessDpiAwarenessContext.restype = ctypes.c_bool
+        user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+        user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    except Exception:
+        pass
+
+
 def main():
+    _enable_dpi_awareness()
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     ui = DigitalWorkerUI()

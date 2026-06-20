@@ -84,7 +84,7 @@ class ActionExecutor:
         """Type a string of text via the keyboard."""
         log.info('Typing text: "%s" (press_enter=%s)', text, press_enter)
         try:
-            pyautogui.write(text, interval=0.05)
+            pyautogui.write(text, interval=settings.TYPING_INTERVAL)
             if press_enter:
                 pyautogui.press('enter')
             msg = f'Successfully typed "{text}"'

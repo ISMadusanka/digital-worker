@@ -34,6 +34,7 @@ _read_text_fn: Optional[Callable[..., str]] = None     # reads foreground window
 _current_goal: str = ""
 _current_ui_state: str = ""
 _current_elements: list = []
+_current_image_scale: float = 1.0
 
 # Completion signalling (set by the finish tool, read by the loop).
 _task_finished: bool = False
@@ -53,12 +54,18 @@ def configure_tools(
     log.info("Tools configured with observe/verify/read callbacks")
 
 
-def set_current_context(goal: str, ui_state: str, elements: Optional[list] = None) -> None:
-    """Update the current goal, UI-state text, and element list for the tools."""
-    global _current_goal, _current_ui_state, _current_elements
+def set_current_context(
+    goal: str,
+    ui_state: str,
+    elements: Optional[list] = None,
+    image_scale: float = 1.0,
+) -> None:
+    """Update the current goal, UI-state text, element list, and image scale."""
+    global _current_goal, _current_ui_state, _current_elements, _current_image_scale
     _current_goal = goal
     _current_ui_state = ui_state
     _current_elements = elements or []
+    _current_image_scale = image_scale or 1.0
 
 
 # --- completion helpers -----------------------------------------------------
@@ -86,7 +93,11 @@ def _resolve_xy(element_id: int, x: int, y: int) -> Optional[tuple[int, int, str
         el = _current_elements[element_id]
         return el.center_x, el.center_y, f'[{element_id}] "{el.text}"'
     if x is not None and x >= 0 and y is not None and y >= 0:
-        return x, y, f"({x}, {y})"
+        # Raw coords come from the (possibly downscaled) image the model saw —
+        # scale them back up to real screen pixels.
+        scale = _current_image_scale or 1.0
+        rx, ry = int(round(x / scale)), int(round(y / scale))
+        return rx, ry, f"({rx}, {ry})"
     return None
 
 
@@ -299,11 +310,11 @@ def open_application(app_name: str) -> str:
     action_desc = f"Opened application '{app_name}'"
     if _executor.hotkey("win", "s").startswith("Failed"):
         return "Failed to open Windows Search."
-    time.sleep(0.8)
+    time.sleep(0.5)
     _executor.type_text(app_name)
-    time.sleep(1.0)
+    time.sleep(0.7)
     _executor.press_key("enter")
-    time.sleep(1.5)
+    time.sleep(1.0)
     return _verify_action(action_desc, _current_ui_state)
 
 
@@ -324,9 +335,11 @@ def read_screen_text(max_chars: int = 6000) -> str:
         text = _read_text_fn(max_chars)
     except Exception as e:
         return f"Failed to read screen text: {e}"
+    title = win.foreground_window_title() or "unknown window"
     if not text.strip():
-        return "(no readable text found in the foreground window)"
-    return f"--- TEXT FROM ACTIVE WINDOW ---\n{text}"
+        return f"(no readable text found in the foreground window: {title})"
+    # Surface WHICH window was read so the model can tell if it read the wrong app.
+    return f"--- TEXT FROM ACTIVE WINDOW: {title} ---\n{text}"
 
 
 @tool

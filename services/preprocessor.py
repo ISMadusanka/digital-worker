@@ -6,6 +6,7 @@ UI elements suitable for LLM consumption.
 from __future__ import annotations
 
 import ast
+import base64
 import io
 import re
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ class UIElement:
     height: int
     confidence: float = 0.0
     element_type: str = "unknown"  # button | display | label | icon
+    window: str = ""  # title of the top-level window this element belongs to
 
     def to_dict(self) -> dict:
         return {
@@ -259,49 +261,85 @@ def format_elements_for_llm(elements: list[UIElement]) -> str:
     if not elements:
         return "No UI elements detected on screen."
 
-    lines = ["UI Elements currently visible on screen (ID | type | text | center):"]
+    # Group elements by their owning window so the structure is clear, then list
+    # each as: [id] <type> "label" @(center_x, center_y). The agent acts by ID
+    # (resolved to authoritative coordinates internally); the @(x,y) is provided
+    # for spatial reasoning. IDs are the element's index in the full list, so they
+    # stay stable regardless of the grouped display order.
+    from collections import OrderedDict
+
+    groups: "OrderedDict[str, list[tuple[int, UIElement]]]" = OrderedDict()
     for idx, elem in enumerate(elements):
-        text = elem.text if len(elem.text) <= 60 else elem.text[:57] + "..."
-        lines.append(
-            f'[{idx}] {elem.element_type:<9} "{text}" '
-            f"({elem.center_x}, {elem.center_y})"
-        )
+        win = elem.window.strip() or "(screen)"
+        groups.setdefault(win, []).append((idx, elem))
+
+    lines = [
+        "Current on-screen UI structure (grouped by window). "
+        "Act on an element using its [ID]:",
+    ]
+    for win, items in groups.items():
+        lines.append(f"\n=== Window: {win} ===")
+        for idx, elem in items:
+            text = elem.text if len(elem.text) <= 60 else elem.text[:57] + "..."
+            lines.append(
+                f'   [{idx}] {elem.element_type:<9} "{text}"  @({elem.center_x},{elem.center_y})'
+            )
     return "\n".join(lines)
 
 
-def annotate_screenshot(png_bytes: bytes, elements: list[UIElement]) -> bytes:
-    """Draw numbered Set-of-Mark boxes over each element on the screenshot.
+def build_vision_image(
+    png_bytes: bytes,
+    elements: list[UIElement],
+    max_width: int = 1280,
+    quality: int = 70,
+    set_of_mark: bool = True,
+) -> tuple[Optional[str], float]:
+    """Produce the image sent to the vision model: optionally downscaled,
+    Set-of-Mark annotated, and JPEG-compressed.
 
-    Returns PNG bytes of the annotated image. The numbers match the IDs from
-    :func:`format_elements_for_llm`, giving the vision model an unambiguous way
-    to point at a specific element.
+    Returns ``(base64_jpeg, scale)`` where ``scale`` is the downscale factor
+    applied (1.0 = none). Boxes/labels are drawn AFTER downscaling so they stay
+    crisp. The numbers match the IDs from :func:`format_elements_for_llm`.
     """
     try:
-        from PIL import Image, ImageDraw
+        from PIL import Image, ImageDraw, ImageFont
     except Exception as e:  # pragma: no cover
-        log.warning("Pillow unavailable, returning un-annotated screenshot: %s", e)
-        return png_bytes
+        log.warning("Pillow unavailable; sending raw screenshot: %s", e)
+        return base64.b64encode(png_bytes).decode("ascii"), 1.0
 
     try:
         img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
-        draw = ImageDraw.Draw(img)
+        orig_w = img.width
+        scale = 1.0
+        if max_width and orig_w > max_width:
+            scale = max_width / orig_w
+            img = img.resize((max_width, round(img.height * scale)), Image.BILINEAR)
 
-        for idx, el in enumerate(elements):
-            x1, y1 = el.x, el.y
-            x2, y2 = el.x + el.width, el.y + el.height
-            draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 60), width=2)
+        if set_of_mark and elements:
+            draw = ImageDraw.Draw(img)
+            try:
+                font = ImageFont.truetype("arial.ttf", 13)
+            except Exception:
+                font = ImageFont.load_default()
 
-            label = str(idx)
-            # Small filled tag at the top-left corner of the box.
-            tw = 8 * len(label) + 6
-            th = 14
-            ty1 = max(0, y1 - th)
-            draw.rectangle([x1, ty1, x1 + tw, ty1 + th], fill=(255, 0, 60))
-            draw.text((x1 + 3, ty1 + 1), label, fill=(255, 255, 255))
+            for idx, el in enumerate(elements):
+                x1, y1 = int(el.x * scale), int(el.y * scale)
+                x2, y2 = int((el.x + el.width) * scale), int((el.y + el.height) * scale)
+                draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 60), width=2)
+
+                label = str(idx)
+                try:
+                    tw = int(draw.textlength(label, font=font))
+                except Exception:
+                    tw = 8 * len(label)
+                th = 15
+                ty1 = max(0, y1 - th)
+                draw.rectangle([x1, ty1, x1 + tw + 4, ty1 + th], fill=(255, 0, 60))
+                draw.text((x1 + 2, ty1 + 1), label, fill=(255, 255, 255), font=font)
 
         out = io.BytesIO()
-        img.save(out, format="PNG")
-        return out.getvalue()
+        img.save(out, format="JPEG", quality=quality)
+        return base64.b64encode(out.getvalue()).decode("ascii"), scale
     except Exception as e:  # pragma: no cover
-        log.warning("Failed to annotate screenshot: %s", e)
-        return png_bytes
+        log.warning("Failed to build vision image: %s", e)
+        return base64.b64encode(png_bytes).decode("ascii"), 1.0

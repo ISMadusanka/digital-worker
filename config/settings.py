@@ -32,11 +32,18 @@ OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o")
 #   "hybrid"     — UIA first, fall back to OmniParser if UIA finds nothing
 PERCEPTION_BACKEND: str = os.getenv("PERCEPTION_BACKEND", "uia").lower()
 
-# Send an annotated screenshot to the (multimodal) model alongside the element list.
-USE_VISION: bool = _as_bool(os.getenv("USE_VISION", "true"))
-# Draw numbered "Set-of-Mark" boxes on the screenshot so the model can reference
-# elements by ID instead of guessing pixel coordinates.
+# Perception is text-only by default: the agent reasons over the structured UI
+# Automation tree, NOT a screenshot. Set USE_VISION=true to also attach an
+# annotated screenshot for multimodal models.
+USE_VISION: bool = _as_bool(os.getenv("USE_VISION", "false"))
+# Draw numbered "Set-of-Mark" boxes on the screenshot (only relevant if vision on).
 SET_OF_MARK: bool = _as_bool(os.getenv("SET_OF_MARK", "true"))
+# Downscale + JPEG-compress the screenshot before sending it to the model. Far
+# fewer image tiles => much faster/cheaper vision calls. Click accuracy is
+# unaffected because actions resolve via element IDs (full-resolution coords);
+# raw fallback coordinates are scaled back up automatically. 0 = no downscale.
+VISION_MAX_WIDTH: int = int(os.getenv("VISION_MAX_WIDTH", "1280"))
+VISION_JPEG_QUALITY: int = int(os.getenv("VISION_JPEG_QUALITY", "70"))
 
 # UI Automation tuning (bounds the tree walk so perception stays fast).
 UIA_MAX_ELEMENTS: int = int(os.getenv("UIA_MAX_ELEMENTS", "150"))
@@ -59,9 +66,11 @@ OMNIPARSER_IMGSZ: int = int(os.getenv("OMNIPARSER_IMGSZ", "640"))
 # many actions, so the iteration budget is generous by default.
 MAX_ACTION_RETRIES: int = int(os.getenv("MAX_ACTION_RETRIES", "4"))
 MAX_AGENT_ITERATIONS: int = int(os.getenv("MAX_AGENT_ITERATIONS", "80"))
-SCREENSHOT_DELAY: float = float(os.getenv("SCREENSHOT_DELAY", "0.5"))
-ACTION_PAUSE: float = float(os.getenv("ACTION_PAUSE", "0.3"))
-MOUSE_MOVE_DURATION: float = float(os.getenv("MOUSE_MOVE_DURATION", "0.3"))
+SCREENSHOT_DELAY: float = float(os.getenv("SCREENSHOT_DELAY", "0.3"))
+ACTION_PAUSE: float = float(os.getenv("ACTION_PAUSE", "0.2"))
+MOUSE_MOVE_DURATION: float = float(os.getenv("MOUSE_MOVE_DURATION", "0.15"))
+# Per-character typing delay. Lower = faster typing (still visibly typed).
+TYPING_INTERVAL: float = float(os.getenv("TYPING_INTERVAL", "0.02"))
 
 # Generate a step-by-step plan up front and track progress against it.
 USE_PLANNER: bool = _as_bool(os.getenv("USE_PLANNER", "true"))

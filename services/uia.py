@@ -100,10 +100,12 @@ class UIAutomationService:
 
         # DFS over the tree. We start from the desktop root so that the taskbar,
         # Start menu, open dialogs/menus, and the foreground app are all covered.
-        stack: list[tuple[object, int]] = [(root, 0)]
+        # Each stack entry carries the label of its top-level window (depth-1
+        # ancestor) so every element can be grouped under the right window.
+        stack: list[tuple[object, int, str]] = [(root, 0, "")]
 
         while stack and len(elements) < settings.UIA_MAX_ELEMENTS and nodes_visited < settings.UIA_MAX_NODES:
-            ctrl, depth = stack.pop()
+            ctrl, depth, win_name = stack.pop()
             nodes_visited += 1
 
             # Fetch the bounding rect once and reuse it (each property is a COM
@@ -127,10 +129,19 @@ class UIAutomationService:
             if depth > 0 and not on_screen:
                 continue
 
+            # At depth 1 the node IS a top-level window — its name labels the
+            # whole subtree below it.
+            this_window = win_name
+            if depth == 1:
+                try:
+                    this_window = (ctrl.Name or "").strip() or ctrl.ControlTypeName
+                except Exception:
+                    this_window = win_name
+
             if depth < settings.UIA_MAX_DEPTH:
                 try:
                     for child in ctrl.GetChildren():
-                        stack.append((child, depth + 1))
+                        stack.append((child, depth + 1, this_window))
                 except Exception:
                     pass
 
@@ -140,6 +151,8 @@ class UIAutomationService:
             element = self._to_element(ctrl, screen_width, screen_height, (rx, ry, rw, rh))
             if element is None:
                 continue
+
+            element.window = this_window or ""
 
             # De-duplicate identical text at the same location.
             key = (element.text, element.center_x // 5, element.center_y // 5)

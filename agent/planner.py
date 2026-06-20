@@ -70,6 +70,7 @@ class AgentPlanner:
         history: str = "",
         iteration: int = 1,
         session_id: str = "default",
+        should_run=None,
     ) -> dict:
         """Invoke the agent to analyze the current screen and act.
 
@@ -100,8 +101,7 @@ class AgentPlanner:
             f"{env_line}"
             f"{('PLAN:' + chr(10) + plan + chr(10) + chr(10)) if plan else ''}"
             f"{('ACTIONS TAKEN SO FAR:' + chr(10) + history + chr(10) + chr(10)) if history else ''}"
-            f"CURRENT SCREEN (iteration {iteration}). "
-            f"Element IDs below match the numbered boxes on the screenshot:\n{ui_state}\n\n"
+            f"CURRENT UI STRUCTURE (iteration {iteration}) — act on an element by its [ID]:\n{ui_state}\n\n"
             "Decide the single next action that best advances the plan, then call ONE tool. "
             "If the screen looks unchanged from your last action, do NOT repeat it — try a different "
             "method. When the entire goal is complete, call finish()."
@@ -113,7 +113,7 @@ class AgentPlanner:
                 {"type": "text", "text": text},
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                    "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
                 },
             ]
         else:
@@ -121,6 +121,10 @@ class AgentPlanner:
 
         messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=content)]
         ai = self.llm_with_tools.invoke(messages)
+
+        # Stop requested while the model was thinking? Don't fire the action.
+        if should_run is not None and not should_run():
+            return {"results": [], "text": "", "tool_called": False, "action_sig": ""}
 
         results: list[str] = []
         tool_called = False
