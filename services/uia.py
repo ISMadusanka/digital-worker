@@ -161,6 +161,19 @@ class UIAutomationService:
             seen.add(key)
             elements.append(element)
 
+        # Mark the element that currently has keyboard focus (one COM call) so
+        # the agent knows where typing will go.
+        try:
+            focused = auto.GetFocusedControl()
+            fr = focused.BoundingRectangle
+            fcx, fcy = (fr.left + fr.right) // 2, (fr.top + fr.bottom) // 2
+            for el in elements:
+                if abs(el.center_x - fcx) <= 3 and abs(el.center_y - fcy) <= 3:
+                    el.state = f"{el.state},focused" if el.state else "focused"
+                    break
+        except Exception:
+            pass
+
         elements.sort(key=lambda e: (e.y, e.x))
         log.info(
             "UIA perception: %d elements (visited %d nodes)",
@@ -219,6 +232,8 @@ class UIAutomationService:
         w = min(w, screen_width - x)
         h = min(h, screen_height - y)
 
+        value, state = self._read_value_and_state(ctrl, element_type)
+
         return UIElement(
             text=name or f"<{element_type}>",
             center_x=x + w // 2,
@@ -229,7 +244,62 @@ class UIAutomationService:
             height=h,
             confidence=1.0,
             element_type=element_type,
+            value=value,
+            state=state,
         )
+
+    @staticmethod
+    def _read_value_and_state(ctrl, element_type: str) -> tuple[str, str]:
+        """Extract the control's value and interaction state via UIA patterns.
+
+        Pattern queries are COM round-trips, so we only run the ones relevant to
+        each control type to keep the tree walk fast.
+        """
+        value = ""
+        states: list[str] = []
+        interactive = element_type in (
+            "button", "input", "checkbox", "radio", "menuitem", "link", "tab",
+            "listitem", "treeitem",
+        )
+
+        if interactive:
+            try:
+                if ctrl.IsEnabled is False:
+                    states.append("disabled")
+            except Exception:
+                pass
+
+        if element_type == "input":
+            try:
+                vp = ctrl.GetValuePattern()
+                v = (vp.Value or "").strip() if vp else ""
+                if v:
+                    value = v if len(v) <= 80 else v[:77] + "..."
+            except Exception:
+                pass
+
+        elif element_type in ("checkbox", "radio"):
+            try:
+                tp = ctrl.GetTogglePattern()
+                ts = tp.ToggleState if tp else None
+                if ts == 1:
+                    states.append("checked")
+                elif ts == 2:
+                    states.append("indeterminate")
+                else:
+                    states.append("unchecked")
+            except Exception:
+                pass
+
+        elif element_type in ("listitem", "tab", "treeitem"):
+            try:
+                sp = ctrl.GetSelectionItemPattern()
+                if sp and sp.IsSelected:
+                    states.append("selected")
+            except Exception:
+                pass
+
+        return value, ",".join(states)
 
     # ------------------------------------------------------------------
     # Content extraction (for "grab the text on this page" style tasks)

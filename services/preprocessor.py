@@ -31,6 +31,8 @@ class UIElement:
     confidence: float = 0.0
     element_type: str = "unknown"  # button | display | label | icon
     window: str = ""  # title of the top-level window this element belongs to
+    value: str = ""   # current value/content (e.g. text in an input)
+    state: str = ""   # comma-joined states (checked, selected, disabled, focused…)
 
     def to_dict(self) -> dict:
         return {
@@ -281,9 +283,13 @@ def format_elements_for_llm(elements: list[UIElement]) -> str:
         lines.append(f"\n=== Window: {win} ===")
         for idx, elem in items:
             text = elem.text if len(elem.text) <= 60 else elem.text[:57] + "..."
-            lines.append(
-                f'   [{idx}] {elem.element_type:<9} "{text}"  @({elem.center_x},{elem.center_y})'
-            )
+            line = f'   [{idx}] {elem.element_type:<9} "{text}"'
+            if elem.value:
+                line += f' = "{elem.value}"'
+            if elem.state:
+                line += f" ({elem.state})"
+            line += f"  @({elem.center_x},{elem.center_y})"
+            lines.append(line)
     return "\n".join(lines)
 
 

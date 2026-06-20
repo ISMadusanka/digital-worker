@@ -79,37 +79,45 @@ class PerceptionService:
 
     # ------------------------------------------------------------------
     def observe(self) -> Perception:
-        """Capture the screen and return a :class:`Perception` snapshot.
+        """Capture the current UI state and return a :class:`Perception`.
 
-        The overlay UI is hidden for the whole pass so it appears in neither the
-        screenshot nor the UI Automation tree.
+        Primary path is the Windows UI Automation tree (text only — no screenshot
+        ever reaches the LLM). A screenshot is taken ONLY when we must fall back
+        to OmniParser (UIA returned nothing) or when vision is explicitly enabled.
+        The overlay UI is hidden for the whole pass so it never appears in the
+        tree, the OmniParser image, or any vision image.
         """
-        # A screenshot is only needed if we send vision to the model or the
-        # OmniParser backend requires the pixels. For the default text-only UIA
-        # path we skip capture entirely — faster, and no image touches the LLM.
-        need_image = settings.USE_VISION or self.backend in ("omniparser", "hybrid")
-
-        with self.screenshot.hidden():
-            png_bytes = (
-                self.screenshot.capture_full_screen(manage_visibility=False)
-                if need_image
-                else None
-            )
-            elements = self._detect_elements(png_bytes)
-
-        text = format_elements_for_llm(elements)
-
         image_b64: str | None = None
         image_scale = 1.0
-        if settings.USE_VISION and png_bytes is not None:
-            image_b64, image_scale = build_vision_image(
-                png_bytes,
-                elements,
-                max_width=settings.VISION_MAX_WIDTH,
-                quality=settings.VISION_JPEG_QUALITY,
-                set_of_mark=settings.SET_OF_MARK,
-            )
 
+        with self.screenshot.hidden():
+            elements: list[UIElement] = []
+
+            # 1) Primary: native UI Automation tree (rich, text-only).
+            if self.backend in ("uia", "hybrid") and self.uia and self.uia.available:
+                elements = self.uia.get_elements(self.screen_width, self.screen_height)
+
+            # 2) Fallback: OmniParser — only if UIA found nothing. Captures a
+            #    screenshot for the OmniParser SERVER (not the LLM).
+            png_bytes: bytes | None = None
+            if not elements and self.omni is not None:
+                log.info("UIA returned no elements — falling back to OmniParser")
+                png_bytes = self.screenshot.capture_full_screen(manage_visibility=False)
+                elements = self._omni_elements(png_bytes)
+
+            # 3) Optional vision image (off by default). Capture lazily if needed.
+            if settings.USE_VISION:
+                if png_bytes is None:
+                    png_bytes = self.screenshot.capture_full_screen(manage_visibility=False)
+                image_b64, image_scale = build_vision_image(
+                    png_bytes,
+                    elements,
+                    max_width=settings.VISION_MAX_WIDTH,
+                    quality=settings.VISION_JPEG_QUALITY,
+                    set_of_mark=settings.SET_OF_MARK,
+                )
+
+        text = format_elements_for_llm(elements)
         return Perception(
             elements=elements, text=text, image_b64=image_b64, image_scale=image_scale
         )
@@ -122,23 +130,15 @@ class PerceptionService:
         return ""
 
     # ------------------------------------------------------------------
-    def _detect_elements(self, png_bytes: bytes) -> list[UIElement]:
-        """Run the configured backend(s) to detect on-screen elements."""
-        elements: list[UIElement] = []
-
-        if self.backend in ("uia", "hybrid") and self.uia and self.uia.available:
-            elements = self.uia.get_elements(self.screen_width, self.screen_height)
-
-        if not elements and self.omni is not None:
-            log.info("Using OmniParser backend for element detection")
-            try:
-                result = self.omni.process_image(png_bytes)
-                elements = preprocess_ocr(
-                    omniparser_result=result,
-                    screen_width=self.screen_width,
-                    screen_height=self.screen_height,
-                )
-            except Exception as e:
-                log.error("OmniParser detection failed: %s", e)
-
-        return elements
+    def _omni_elements(self, png_bytes: bytes) -> list[UIElement]:
+        """Run the OmniParser fallback and return detected elements."""
+        try:
+            result = self.omni.process_image(png_bytes)
+            return preprocess_ocr(
+                omniparser_result=result,
+                screen_width=self.screen_width,
+                screen_height=self.screen_height,
+            )
+        except Exception as e:
+            log.error("OmniParser detection failed: %s", e)
+            return []

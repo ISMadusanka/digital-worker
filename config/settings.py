@@ -27,10 +27,12 @@ OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o")
 # Perception
 # ---------------------------------------------------------------------------
 # Which backend produces the list of on-screen UI elements:
-#   "uia"        — native Windows UI Automation accessibility tree (no GPU, default)
+#   "uia"        — native Windows UI Automation accessibility tree only (no GPU)
 #   "omniparser" — local OmniParser GPU server (requires OMNIPARSER_API_URL up)
-#   "hybrid"     — UIA first, fall back to OmniParser if UIA finds nothing
-PERCEPTION_BACKEND: str = os.getenv("PERCEPTION_BACKEND", "uia").lower()
+#   "hybrid"     — UIA first, fall back to OmniParser only if UIA finds nothing
+#                  (default). The OmniParser screenshot goes to the OmniParser
+#                  server, never to the LLM.
+PERCEPTION_BACKEND: str = os.getenv("PERCEPTION_BACKEND", "hybrid").lower()
 
 # Perception is text-only by default: the agent reasons over the structured UI
 # Automation tree, NOT a screenshot. Set USE_VISION=true to also attach an
