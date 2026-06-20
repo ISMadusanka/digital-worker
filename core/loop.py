@@ -1,119 +1,115 @@
 """
-The core action-verification loop that ties perception and reasoning together.
+The core observe → plan → act loop that drives the worker.
+
+Flow per iteration:
+  1. Observe the current screen (screenshot + element detection + annotation).
+  2. Ask the agent to decide and execute the next action toward the plan.
+  3. Re-observe on the next iteration; the agent self-corrects from the fresh state.
+
+Completion is signalled explicitly by the agent calling the ``finish`` tool.
 """
 
-from typing import Optional
-
 from config import settings
+from agent import tools
 from utils.logger import get_logger
 
 log = get_logger(__name__)
 
 
 class ActionVerificationLoop:
-    """Manages the iteration loop: Observe → Plan (single action) → Verify → Repeat."""
+    """Manages the iteration loop: Observe → Act → Re-observe → Repeat."""
 
     def __init__(self, worker_instance) -> None:
-        # We take the worker instance to call its observe/plan methods without circular imports
         self.worker = worker_instance
-        self.max_retries = settings.MAX_ACTION_RETRIES
 
     def run_until_complete(self, goal: str) -> str:
-        """Run the observe-plan-act loop until the LLM indicates completion
-        or we hit max iterations.
+        """Run the observe-act loop until the agent calls finish() or we hit
+        the iteration ceiling."""
+        # Build a high-level plan up front; the agent follows it step by step.
+        plan = self.worker.make_plan(goal)
+        if plan:
+            self.worker.emit_step("Plan ready.")
 
-        Each iteration:
-          1. Observe the current UI state (screenshot + OCR).
-          2. Ask the agent to decide and execute ONE action.
-          3. The action tool automatically verifies via screenshot + OCR + LLM.
-          4. If verification failed, the tool returns failure info to the agent,
-             which can then adapt in subsequent iterations.
-        """
         iteration = 1
-        consecutive_failures = 0
-        
+        last_action_summary = ""
+        history: list[str] = []
+        last_sig = ""
+        repeat_count = 0
+
         while iteration <= settings.MAX_AGENT_ITERATIONS:
             if self.worker.stop_requested:
                 log.info("Execution stopped by user.")
                 return "Execution stopped by user."
 
             log.info("=== Loop Iteration %d ===", iteration)
-            self.worker.emit_step("Observing screen...")
-            
-            # 1. Observe (Screenshot + OCR + Preprocess)
-            ui_state = self.worker.observe()
-            
+            self.worker.emit_step(f"[{iteration}] Observing screen...")
+
+            # 1. Observe
+            perception = self.worker.observe()
             if self.worker.stop_requested:
                 return "Execution stopped by user."
 
-            self.worker.emit_step("Planning next action...")
-            
-            # 2. Plan and Act (Agent decides ONE action and calls a tool)
-            #    The tool internally captures after-state and runs verification.
-            response = self.worker.reason_and_act(goal, ui_state)
-            
-            messages = response.get("messages", [])
-            agent_output = messages[-1].content if messages else ""
-            
-            # Check if verification failed in this iteration by examining
-            # tool responses in the message history.
-            verification_failed = self._check_for_verification_failure(messages)
-            
-            if verification_failed:
-                consecutive_failures += 1
-                log.warning(
-                    "Verification failure detected (consecutive: %d/%d)",
-                    consecutive_failures,
-                    self.max_retries,
+            self.worker.emit_step(f"[{iteration}] Deciding next action...")
+
+            # 2. Decide and act (agent calls a tool)
+            history_text = "\n".join(history[-12:])  # recent actions, bounded
+            try:
+                response = self.worker.reason_and_act(
+                    goal, perception, plan, history_text, iteration
                 )
-                if consecutive_failures >= self.max_retries:
-                    log.error(
-                        "Too many consecutive verification failures (%d). Aborting.",
-                        consecutive_failures,
-                    )
-                    return (
-                        f"Failed: {consecutive_failures} consecutive action verification "
-                        f"failures. Last agent output: {agent_output}"
-                    )
+            except Exception as e:
+                log.error("Agent step failed: %s", e)
+                self.worker.emit_step(f"Step error: {e}")
+                iteration += 1
+                continue
+
+            results = response.get("results", [])
+            agent_text = response.get("text", "") or ""
+            last_action_summary = (results[0] if results else agent_text).strip()
+
+            if last_action_summary:
+                self.worker.emit_step(last_action_summary[:120])
+                history.append(f"{iteration}. {last_action_summary[:200]}")
             else:
-                # Reset counter on any successful iteration
-                consecutive_failures = 0
-            
-            # The agent should state when it's done. 
-            # We look for keywords, or just rely on LangChain's finish logic.
-            # In a standard setup, if the agent doesn't call a tool, it returns text to the user.
-            if "complete" in agent_output.lower() or "achieved" in agent_output.lower() or "finished" in agent_output.lower():
-                log.info("Goal achieved according to agent!")
+                # No tool call and no text — nudge it forward next turn.
+                history.append(f"{iteration}. (no action taken)")
+            log.info("Iteration %d action: %s", iteration, last_action_summary or "(none)")
+
+            # 2b. Stuck-loop detection — never let it repeat one dead action forever.
+            sig = response.get("action_sig", "")
+            if sig and sig == last_sig:
+                repeat_count += 1
+            else:
+                repeat_count = 0
+                last_sig = sig
+
+            if repeat_count >= 2:  # 3rd identical action in a row
+                warn = (
+                    "STUCK: the exact same action just ran "
+                    f"{repeat_count + 1} times with no effect. STOP repeating it — press 'escape' "
+                    "to close any stuck menu and use a DIFFERENT method (e.g. a keyboard shortcut)."
+                )
+                log.warning(warn)
+                history.append(f"{iteration}. {warn}")
+            if repeat_count >= 5:  # 6th identical action — give up gracefully
+                msg = (
+                    f"Aborted: repeated the same action {repeat_count + 1} times without progress "
+                    f"({sig}). It likely hit an unreliable UI path."
+                )
+                log.error(msg)
+                self.worker.emit_step("Stuck — aborting.")
+                return msg
+
+            # 3. Completion check — the agent calls finish() when done.
+            if tools.is_finished():
+                summary = tools.get_finish_summary() or agent_text
+                log.info("Goal complete: %s", summary)
                 self.worker.emit_step("Goal achieved!")
-                return f"Success after {iteration} iterations: {agent_output}"
-                
-            log.info("Agent output this iteration: %s", agent_output)
-            self.worker.emit_step(f"Agent says: {agent_output}")
-            
-            # The agent called a tool (or multiple) as part of `reason_and_act`.
-            # LangChain's AgentExecutor handles the immediate loop of tool calling,
-            # but we force a fresh UI state fetch by wrapping it here if it exits to us.
-            
+                return f"Success after {iteration} iteration(s): {summary}"
+
             iteration += 1
 
-        return f"Failed: Reached maximum iterations ({settings.MAX_AGENT_ITERATIONS})."
-
-    @staticmethod
-    def _check_for_verification_failure(messages: list) -> bool:
-        """Scan the agent's message history for verification failure markers.
-
-        Tool responses containing '❌' or 'VERIFICATION FAILED' indicate
-        that an action did not pass verification.
-        """
-        for msg in messages:
-            # Tool messages have content with our verification markers
-            content = ""
-            if hasattr(msg, "content") and isinstance(msg.content, str):
-                content = msg.content
-            elif isinstance(msg, dict) and "content" in msg:
-                content = str(msg["content"])
-
-            if "❌" in content or "VERIFICATION FAILED" in content:
-                return True
-
-        return False
+        return (
+            f"Reached the maximum of {settings.MAX_AGENT_ITERATIONS} iterations. "
+            f"Last action: {last_action_summary}"
+        )

@@ -6,6 +6,7 @@ UI elements suitable for LLM consumption.
 from __future__ import annotations
 
 import ast
+import io
 import re
 from dataclasses import dataclass
 from typing import Optional
@@ -243,22 +244,64 @@ def preprocess_ocr(
 
 
 def format_elements_for_llm(elements: list[UIElement]) -> str:
-    """Format UI elements as a human-readable string for the LLM.
+    """Format UI elements as a numbered, human-readable list for the LLM.
+
+    Each element is prefixed with an integer **ID** that matches the numbered
+    box drawn on the annotated screenshot (Set-of-Mark). The agent can act on an
+    element by passing its ``element_id`` instead of guessing pixel coordinates.
 
     Example output::
 
-        UI Elements currently visible:
-        [button] "5" at (320, 450) — click target: (320, 450)
-        [display] "42" at (300, 120) — click target: (300, 120)
+        UI Elements currently visible on screen (ID | type | text | center):
+        [0] button   "5"          (320, 450)
+        [1] display  "42"         (300, 120)
     """
     if not elements:
         return "No UI elements detected on screen."
 
-    lines = ["UI Elements currently visible on screen:"]
-    for elem in elements:
+    lines = ["UI Elements currently visible on screen (ID | type | text | center):"]
+    for idx, elem in enumerate(elements):
+        text = elem.text if len(elem.text) <= 60 else elem.text[:57] + "..."
         lines.append(
-            f'  [{elem.element_type}] "{elem.text}" '
-            f"at ({elem.center_x}, {elem.center_y}) "
-            f"— size {elem.width}×{elem.height}"
+            f'[{idx}] {elem.element_type:<9} "{text}" '
+            f"({elem.center_x}, {elem.center_y})"
         )
     return "\n".join(lines)
+
+
+def annotate_screenshot(png_bytes: bytes, elements: list[UIElement]) -> bytes:
+    """Draw numbered Set-of-Mark boxes over each element on the screenshot.
+
+    Returns PNG bytes of the annotated image. The numbers match the IDs from
+    :func:`format_elements_for_llm`, giving the vision model an unambiguous way
+    to point at a specific element.
+    """
+    try:
+        from PIL import Image, ImageDraw
+    except Exception as e:  # pragma: no cover
+        log.warning("Pillow unavailable, returning un-annotated screenshot: %s", e)
+        return png_bytes
+
+    try:
+        img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+        draw = ImageDraw.Draw(img)
+
+        for idx, el in enumerate(elements):
+            x1, y1 = el.x, el.y
+            x2, y2 = el.x + el.width, el.y + el.height
+            draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 60), width=2)
+
+            label = str(idx)
+            # Small filled tag at the top-left corner of the box.
+            tw = 8 * len(label) + 6
+            th = 14
+            ty1 = max(0, y1 - th)
+            draw.rectangle([x1, ty1, x1 + tw, ty1 + th], fill=(255, 0, 60))
+            draw.text((x1 + 3, ty1 + 1), label, fill=(255, 255, 255))
+
+        out = io.BytesIO()
+        img.save(out, format="PNG")
+        return out.getvalue()
+    except Exception as e:  # pragma: no cover
+        log.warning("Failed to annotate screenshot: %s", e)
+        return png_bytes

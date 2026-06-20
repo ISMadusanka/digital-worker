@@ -6,4 +6,15 @@ langchain-core>=0.3.0
 langgraph>=0.2.0
 python-dotenv>=1.0.0
 Pillow>=10.0.0
-PyQt6>=6.0.0
+# Pinned to the Qt 6.8 LTS line — Qt 6.11 fails to load ("procedure could not
+# be found") on some Windows setups. Keep the binding and runtime versions matched.
+PyQt6==6.8.1
+PyQt6-Qt6==6.8.1
+PyQt6-sip>=13.8
+
+# Native Windows perception (UI Automation accessibility tree). No GPU required.
+uiautomation>=2.0.18
+comtypes>=1.2.0
+
+# Real Word document creation for the create_document tool.
+python-docx>=1.1.0

@@ -1,87 +1,114 @@
 """
 LangChain tools that the agent can use to interact with the system.
 
-Each tool automatically captures before/after UI states and verifies
-the action via the ActionVerificationService when verification is enabled.
+Action tools (click/type/...) operate on Windows 11 via PyAutoGUI. Mouse tools
+accept an ``element_id`` (matching the numbered Set-of-Mark boxes / the UI-state
+list) so the agent points at a real element instead of guessing coordinates;
+raw (x, y) coordinates are still accepted as a fallback.
 
-Enhanced with Windows 11-specific tools: right-click, scroll, drag,
-shell command execution, and an open_application convenience tool.
+Also exposes Windows power tools (read on-screen text, create folders/files/Word
+documents, run shell commands) and an explicit ``finish`` signal.
 """
 
 from __future__ import annotations
 
 import time
-from typing import Any, Optional, Callable
+from typing import Any, Callable, Optional
 
 from langchain.tools import tool
 
 from actions.executor import ActionExecutor
 from config import settings
 from utils.logger import get_logger
+from utils import win
 
 log = get_logger(__name__)
 
 # Global executor instance for tools to use
 _executor = ActionExecutor()
 
-# These are set at runtime by the DigitalWorker when it initializes.
-# They allow tools to call back into the worker for observation and verification.
-_observe_fn: Optional[Callable[[], str]] = None
+# Set at runtime by the DigitalWorker (avoids circular imports).
+_observe_fn: Optional[Callable[[], Any]] = None        # returns a Perception
 _verify_fn: Optional[Callable[..., Any]] = None
+_read_text_fn: Optional[Callable[..., str]] = None     # reads foreground window text
 _current_goal: str = ""
 _current_ui_state: str = ""
+_current_elements: list = []
+
+# Completion signalling (set by the finish tool, read by the loop).
+_task_finished: bool = False
+_finish_summary: str = ""
 
 
 def configure_tools(
-    observe_fn: Callable[[], str],
+    observe_fn: Callable[[], Any],
     verify_fn: Callable[..., Any],
+    read_text_fn: Optional[Callable[..., str]] = None,
 ) -> None:
-    """Set the observation and verification callbacks.
-
-    Called once by ``DigitalWorker.__init__`` so that tools can capture
-    fresh UI state and trigger verification without circular imports.
-    """
-    global _observe_fn, _verify_fn
+    """Wire up the worker callbacks used by tools."""
+    global _observe_fn, _verify_fn, _read_text_fn
     _observe_fn = observe_fn
     _verify_fn = verify_fn
-    log.info("Tools configured with observe/verify callbacks")
+    _read_text_fn = read_text_fn
+    log.info("Tools configured with observe/verify/read callbacks")
 
 
-def set_current_context(goal: str, ui_state: str) -> None:
-    """Update the current goal and UI state so tools can access them.
-
-    Called by ``DigitalWorker.reason_and_act`` before each agent invocation.
-    """
-    global _current_goal, _current_ui_state
+def set_current_context(goal: str, ui_state: str, elements: Optional[list] = None) -> None:
+    """Update the current goal, UI-state text, and element list for the tools."""
+    global _current_goal, _current_ui_state, _current_elements
     _current_goal = goal
     _current_ui_state = ui_state
+    _current_elements = elements or []
 
 
+# --- completion helpers -----------------------------------------------------
+def reset_finished() -> None:
+    global _task_finished, _finish_summary
+    _task_finished = False
+    _finish_summary = ""
+
+
+def is_finished() -> bool:
+    return _task_finished
+
+
+def get_finish_summary() -> str:
+    return _finish_summary
+
+
+# --- coordinate resolution --------------------------------------------------
+def _resolve_xy(element_id: int, x: int, y: int) -> Optional[tuple[int, int, str]]:
+    """Resolve a target point from an element ID or explicit coordinates.
+
+    Returns (x, y, label) or None if it can't be resolved.
+    """
+    if element_id is not None and 0 <= element_id < len(_current_elements):
+        el = _current_elements[element_id]
+        return el.center_x, el.center_y, f'[{element_id}] "{el.text}"'
+    if x is not None and x >= 0 and y is not None and y >= 0:
+        return x, y, f"({x}, {y})"
+    return None
 
 
 def _verify_action(action_description: str, ui_state_before: str) -> str:
-    """Shared verification logic for all action tools.
+    """Optional post-action verification.
 
-    1. Wait for UI to settle.
-    2. Capture a fresh screenshot + OCR (the 'after' state).
-    3. Ask the verification LLM to compare before/after.
-    4. If verification fails, attempt Ctrl+Z undo.
-    5. Return a detailed status message for the agent.
+    Disabled by default: the agent re-observes a fresh screen each iteration and
+    self-corrects. When ``VERIFY_AFTER_ACTION`` is on, captures the after-state
+    and asks the LLM to judge; only undoes when ``VERIFY_AUTO_UNDO`` is also on.
     """
     if not settings.VERIFY_AFTER_ACTION or _verify_fn is None or _observe_fn is None:
-        return f"{action_description} — (verification disabled)"
+        return f"OK: {action_description}"
 
-    # Wait for the UI to settle after the action
     time.sleep(settings.VERIFICATION_DELAY)
 
-    # Capture the after-state
     try:
-        ui_state_after = _observe_fn()
+        after = _observe_fn()
+        ui_state_after = getattr(after, "text", str(after))
     except Exception as e:
         log.error("Failed to capture post-action UI state: %s", e)
-        return f"{action_description} — verification skipped (observation error: {e})"
+        return f"OK: {action_description} (verification skipped: {e})"
 
-    # Run verification
     result = _verify_fn(
         action_description=action_description,
         ui_state_before=ui_state_before,
@@ -90,29 +117,19 @@ def _verify_action(action_description: str, ui_state_before: str) -> str:
     )
 
     if result.verified:
-        return (
-            f"✅ {action_description} — VERIFIED: {result.explanation}"
-        )
-    else:
-        # Attempt undo
-        log.warning(
-            "Action verification FAILED: %s. Attempting undo...",
-            result.explanation,
-        )
+        return f"VERIFIED: {action_description} — {result.explanation}"
+
+    log.warning("Action verification FAILED: %s", result.explanation)
+    undo_note = ""
+    if settings.VERIFY_AUTO_UNDO:
         undo_result = _executor.undo()
-        log.info("Undo result: %s", undo_result)
+        undo_note = f" Undo attempted ({undo_result})."
 
-        correction_hint = ""
-        if result.suggested_correction:
-            correction_hint = (
-                f" Suggested correction: {result.suggested_correction}"
-            )
-
-        return (
-            f"❌ {action_description} — VERIFICATION FAILED: {result.explanation}. "
-            f"Undo attempted ({undo_result}).{correction_hint} "
-            f"Please re-examine the UI state and try a different approach."
-        )
+    hint = f" Suggested correction: {result.suggested_correction}" if result.suggested_correction else ""
+    return (
+        f"VERIFICATION FAILED: {action_description} — {result.explanation}.{undo_note}{hint} "
+        f"Re-examine the fresh UI state and try a different approach."
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -120,139 +137,105 @@ def _verify_action(action_description: str, ui_state_before: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 
 @tool
-def click_element(element_name: str, x: int, y: int) -> str:
-    """Click on a UI element at the specified screen coordinates.
+def click_element(element_id: int = -1, x: int = -1, y: int = -1, description: str = "") -> str:
+    """Single-click a UI element.
 
     Args:
-        element_name: A short description of what is being clicked (for logging purposes).
-        x: The X coordinate on the screen.
-        y: The Y coordinate on the screen.
-
-    Returns:
-        A status message indicating success or failure, including verification result.
+        element_id: ID of the target element from the UI-state list / numbered
+            screenshot boxes. PREFERRED — use this whenever the element is listed.
+        x: Fallback X coordinate (only if the element isn't in the list).
+        y: Fallback Y coordinate.
+        description: Short note about what is being clicked (for logging).
     """
-    ui_state_before = _current_ui_state
-    action_desc = f"Clicked '{element_name}' at ({x}, {y})"
-
-    click_result = _executor.click(x, y)
-    if click_result.startswith("Failed"):
-        return click_result
-
-    return _verify_action(action_desc, ui_state_before)
+    target = _resolve_xy(element_id, x, y)
+    if target is None:
+        return "Failed: provide a valid element_id (from the UI list) or x/y coordinates."
+    tx, ty, label = target
+    action_desc = f"Clicked {description or label} at ({tx}, {ty})"
+    result = _executor.click(tx, ty)
+    if result.startswith("Failed"):
+        return result
+    return _verify_action(action_desc, _current_ui_state)
 
 
 @tool
-def double_click_element(element_name: str, x: int, y: int) -> str:
-    """Double-click on a UI element at the specified screen coordinates.
+def double_click_element(element_id: int = -1, x: int = -1, y: int = -1, description: str = "") -> str:
+    """Double-click a UI element (open apps, files, folders).
 
-    Use this to open applications from desktop shortcuts, open files, or
-    any action that requires a double-click.
-
-    Args:
-        element_name: A short description of what is being double-clicked.
-        x: The X coordinate on the screen.
-        y: The Y coordinate on the screen.
-
-    Returns:
-        A status message indicating success or failure, including verification result.
+    Prefer ``element_id``; fall back to ``x``/``y`` if needed.
     """
-    ui_state_before = _current_ui_state
-    action_desc = f"Double-clicked '{element_name}' at ({x}, {y})"
-
-    click_result = _executor.double_click(x, y)
-    if click_result.startswith("Failed"):
-        return click_result
-
-    return _verify_action(action_desc, ui_state_before)
+    target = _resolve_xy(element_id, x, y)
+    if target is None:
+        return "Failed: provide a valid element_id or x/y coordinates."
+    tx, ty, label = target
+    action_desc = f"Double-clicked {description or label} at ({tx}, {ty})"
+    result = _executor.double_click(tx, ty)
+    if result.startswith("Failed"):
+        return result
+    return _verify_action(action_desc, _current_ui_state)
 
 
 @tool
-def right_click_element(element_name: str, x: int, y: int) -> str:
-    """Right-click on a UI element to open its context menu.
+def right_click_element(element_id: int = -1, x: int = -1, y: int = -1, description: str = "") -> str:
+    """Right-click a UI element to open its Windows 11 context menu.
 
-    On Windows 11, right-clicking opens a compact context menu. If you need
-    the full classic context menu, look for "Show more options" at the bottom
-    of the compact menu and click it.
-
-    Common uses: desktop right-click for display settings/personalize,
-    file/folder right-click for copy/cut/paste/rename/delete/properties,
-    taskbar right-click for taskbar settings.
-
-    Args:
-        element_name: A short description of what is being right-clicked.
-        x: The X coordinate on the screen.
-        y: The Y coordinate on the screen.
-
-    Returns:
-        A status message indicating success or failure, including verification result.
+    Prefer ``element_id``; fall back to ``x``/``y`` if needed. If you need the
+    full classic menu, click "Show more options" in the compact menu afterwards.
     """
-    ui_state_before = _current_ui_state
-    action_desc = f"Right-clicked '{element_name}' at ({x}, {y})"
-
-    click_result = _executor.right_click(x, y)
-    if click_result.startswith("Failed"):
-        return click_result
-
-    return _verify_action(action_desc, ui_state_before)
+    target = _resolve_xy(element_id, x, y)
+    if target is None:
+        return "Failed: provide a valid element_id or x/y coordinates."
+    tx, ty, label = target
+    action_desc = f"Right-clicked {description or label} at ({tx}, {ty})"
+    result = _executor.right_click(tx, ty)
+    if result.startswith("Failed"):
+        return result
+    return _verify_action(action_desc, _current_ui_state)
 
 
 @tool
-def scroll(direction: str, amount: int = 3, x: int = -1, y: int = -1) -> str:
-    """Scroll the mouse wheel up or down to navigate content.
-
-    Use this to scroll through long lists, web pages, settings panels,
-    File Explorer, or any scrollable content on Windows 11.
+def scroll(direction: str, amount: int = 3, element_id: int = -1, x: int = -1, y: int = -1) -> str:
+    """Scroll the mouse wheel up or down.
 
     Args:
-        direction: Either "up" or "down".
-        amount: Number of scroll clicks (default 3). Use larger values for faster scrolling.
-        x: Optional X coordinate to scroll at (-1 to use current mouse position).
-        y: Optional Y coordinate to scroll at (-1 to use current mouse position).
-
-    Returns:
-        A status message indicating success or failure, including verification result.
+        direction: "up" or "down".
+        amount: Number of scroll clicks (larger = faster).
+        element_id: Optional element to scroll over.
+        x, y: Optional coordinates to scroll over (used if no element_id).
     """
-    ui_state_before = _current_ui_state
     clicks = amount if direction.lower() == "up" else -amount
-    pos_x = x if x >= 0 else None
-    pos_y = y if y >= 0 else None
-
-    action_desc = f"Scrolled {direction} {amount} clicks"
-    if pos_x is not None:
-        action_desc += f" at ({pos_x}, {pos_y})"
-
-    scroll_result = _executor.scroll(clicks, pos_x, pos_y)
-    if scroll_result.startswith("Failed"):
-        return scroll_result
-
-    return _verify_action(action_desc, ui_state_before)
+    target = _resolve_xy(element_id, x, y)
+    pos_x, pos_y = (target[0], target[1]) if target else (None, None)
+    action_desc = f"Scrolled {direction} {amount}"
+    result = _executor.scroll(clicks, pos_x, pos_y)
+    if result.startswith("Failed"):
+        return result
+    return _verify_action(action_desc, _current_ui_state)
 
 
 @tool
-def drag_element(element_name: str, start_x: int, start_y: int, end_x: int, end_y: int) -> str:
-    """Drag a UI element from one position to another.
+def drag_element(
+    start_element_id: int = -1,
+    start_x: int = -1,
+    start_y: int = -1,
+    end_element_id: int = -1,
+    end_x: int = -1,
+    end_y: int = -1,
+    description: str = "",
+) -> str:
+    """Drag from one point to another (move files, sliders, etc.).
 
-    Use this for drag-and-drop operations such as moving files in File Explorer,
-    rearranging items, resizing windows by dragging edges, moving sliders, etc.
-
-    Args:
-        element_name: A short description of what is being dragged.
-        start_x: The starting X coordinate (where to pick up).
-        start_y: The starting Y coordinate (where to pick up).
-        end_x: The ending X coordinate (where to drop).
-        end_y: The ending Y coordinate (where to drop).
-
-    Returns:
-        A status message indicating success or failure, including verification result.
+    Specify the start and end either by element IDs or by coordinates.
     """
-    ui_state_before = _current_ui_state
-    action_desc = f"Dragged '{element_name}' from ({start_x}, {start_y}) to ({end_x}, {end_y})"
-
-    drag_result = _executor.drag(start_x, start_y, end_x, end_y)
-    if drag_result.startswith("Failed"):
-        return drag_result
-
-    return _verify_action(action_desc, ui_state_before)
+    start = _resolve_xy(start_element_id, start_x, start_y)
+    end = _resolve_xy(end_element_id, end_x, end_y)
+    if start is None or end is None:
+        return "Failed: provide valid start/end element IDs or coordinates."
+    action_desc = f"Dragged {description or start[2]} -> {end[2]}"
+    result = _executor.drag(start[0], start[1], end[0], end[1])
+    if result.startswith("Failed"):
+        return result
+    return _verify_action(action_desc, _current_ui_state)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -261,188 +244,244 @@ def drag_element(element_name: str, start_x: int, start_y: int, end_x: int, end_
 
 @tool
 def type_text(text: str, press_enter: bool = False) -> str:
-    """Type a string of text using the keyboard.
+    """Type a string via the keyboard into the currently focused field.
 
     Args:
         text: The text to type.
-        press_enter: If True, automatically press the Enter key immediately after typing the text. 
-                     Set this to True when typing into search bars, address bars, or any text field 
-                     where you want to submit the input immediately (e.g., Chrome address bar).
-
-    Returns:
-        A status message indicating success or failure, including verification result.
+        press_enter: If True, press Enter right after typing. Use True for search
+            bars, browser address bars, and any field you want to submit
+            immediately (prevents autocomplete from corrupting the input).
     """
-    ui_state_before = _current_ui_state
-    action_desc = f'Typed text: "{text}"'
-    if press_enter:
-        action_desc += ' and pressed Enter'
-
-    type_result = _executor.type_text(text, press_enter=press_enter)
-    if type_result.startswith("Failed"):
-        return type_result
-
-    return _verify_action(action_desc, ui_state_before)
+    action_desc = f'Typed "{text}"' + (" + Enter" if press_enter else "")
+    result = _executor.type_text(text, press_enter=press_enter)
+    if result.startswith("Failed"):
+        return result
+    return _verify_action(action_desc, _current_ui_state)
 
 
 @tool
 def press_key(key: str) -> str:
-    """Press a specific keyboard key (e.g., 'enter', 'tab', 'escape').
-
-    Args:
-        key: The name of the key to press.
-
-    Returns:
-        A status message indicating success or failure, including verification result.
-    """
-    ui_state_before = _current_ui_state
-    action_desc = f"Pressed key: '{key}'"
-
-    press_result = _executor.press_key(key)
-    if press_result.startswith("Failed"):
-        return press_result
-
-    return _verify_action(action_desc, ui_state_before)
+    """Press a single key (e.g., 'enter', 'tab', 'escape', 'down', 'f2')."""
+    action_desc = f"Pressed '{key}'"
+    result = _executor.press_key(key)
+    if result.startswith("Failed"):
+        return result
+    return _verify_action(action_desc, _current_ui_state)
 
 
 @tool
 def press_hotkey(keys: str) -> str:
-    """Press a keyboard shortcut / key combination.
-
-    Use this for multi-key combos. On Windows 11, important shortcuts include:
-    - win+s: Open Windows Search
-    - win+i: Open Settings
-    - win+e: Open File Explorer
-    - ctrl+shift+esc: Open Task Manager
-    - win+d: Show/hide desktop
-    - alt+tab: Switch windows
-    - alt+F4: Close active window
-    - win+l: Lock computer
-    - ctrl+c / ctrl+v: Copy / Paste
-    - win+shift+s: Snipping Tool screenshot
-    - win+x: Quick Link / Power User menu
+    """Press a key combination, e.g. 'win+s', 'ctrl+c', 'alt+f4', 'win+e'.
 
     Args:
-        keys: The keys to press simultaneously, separated by '+'.
-              Examples: 'win+s', 'ctrl+c', 'alt+F4', 'ctrl+shift+esc'.
-
-    Returns:
-        A status message indicating success or failure, including verification result.
+        keys: Keys joined by '+', pressed simultaneously.
     """
-    ui_state_before = _current_ui_state
-    key_list = [k.strip() for k in keys.split('+')]
-    action_desc = f"Pressed hotkey: '{keys}'"
-
-    hotkey_result = _executor.hotkey(*key_list)
-    if hotkey_result.startswith("Failed"):
-        return hotkey_result
-
-    return _verify_action(action_desc, ui_state_before)
+    key_list = [k.strip() for k in keys.split("+")]
+    action_desc = f"Pressed hotkey '{keys}'"
+    result = _executor.hotkey(*key_list)
+    if result.startswith("Failed"):
+        return result
+    return _verify_action(action_desc, _current_ui_state)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# WINDOWS 11 SPECIFIC TOOLS
+# WINDOWS 11 POWER TOOLS
 # ═══════════════════════════════════════════════════════════════════════════
 
 @tool
 def open_application(app_name: str) -> str:
-    """Open a Windows 11 application using the Start Menu search.
-
-    This is a convenience tool that automates the pattern:
-    Win+S → type app name → press Enter.
-
-    Use this when you need to launch an application by name. The function
-    opens Windows Search, types the application name, and presses Enter
-    to launch the top result.
+    """Open a Windows 11 app via Start search (Win+S -> type -> Enter).
 
     Args:
-        app_name: The name of the application to open (e.g., "Calculator",
-                  "Notepad", "File Explorer", "Paint", "Edge", "Chrome",
-                  "Word", "Excel", "PowerPoint", "VS Code", "Terminal").
-
-    Returns:
-        A status message indicating the application launch was initiated.
+        app_name: e.g. "Calculator", "Notepad", "File Explorer", "Edge",
+            "Chrome", "Word", "Paint", "Terminal".
     """
-    ui_state_before = _current_ui_state
-    action_desc = f"Opening application: '{app_name}'"
+    action_desc = f"Opened application '{app_name}'"
+    if _executor.hotkey("win", "s").startswith("Failed"):
+        return "Failed to open Windows Search."
+    time.sleep(0.8)
+    _executor.type_text(app_name)
+    time.sleep(1.0)
+    _executor.press_key("enter")
+    time.sleep(1.5)
+    return _verify_action(action_desc, _current_ui_state)
 
-    # Step 1: Open Windows Search
-    hotkey_result = _executor.hotkey("win", "s")
-    if hotkey_result.startswith("Failed"):
-        return f"Failed to open Windows Search: {hotkey_result}"
 
-    time.sleep(0.8)  # Wait for search to appear
+@tool
+def read_screen_text(max_chars: int = 6000) -> str:
+    """Read the visible text content of the CURRENT foreground window.
 
-    # Step 2: Type the application name
-    type_result = _executor.type_text(app_name)
-    if type_result.startswith("Failed"):
-        return f"Failed to type app name: {type_result}"
+    Use this to "grab" information off the screen — e.g. news headlines in a
+    browser, an article's text, search results, or a document's contents — so
+    you can summarise or copy it elsewhere. Returns the extracted text.
 
-    time.sleep(1.0)  # Wait for search results to populate
+    Args:
+        max_chars: Maximum characters to return.
+    """
+    if _read_text_fn is None:
+        return "read_screen_text is unavailable (no reader configured)."
+    try:
+        text = _read_text_fn(max_chars)
+    except Exception as e:
+        return f"Failed to read screen text: {e}"
+    if not text.strip():
+        return "(no readable text found in the foreground window)"
+    return f"--- TEXT FROM ACTIVE WINDOW ---\n{text}"
 
-    # Step 3: Press Enter to launch the top result
-    press_result = _executor.press_key("enter")
-    if press_result.startswith("Failed"):
-        return f"Failed to press Enter: {press_result}"
 
-    time.sleep(1.5)  # Wait for the app to open
+@tool
+def create_folder(path: str) -> str:
+    """Create a folder (and any parent folders).
 
-    return _verify_action(action_desc, ui_state_before)
+    Accepts known-folder shortcuts, e.g. "desktop/News", "documents/Reports",
+    or an absolute path like "C:\\Users\\me\\Desktop\\News".
+
+    Args:
+        path: Destination folder path.
+    """
+    try:
+        target = win.resolve_path(path)
+        target.mkdir(parents=True, exist_ok=True)
+        return f"Created folder: {target}"
+    except Exception as e:
+        return f"Failed to create folder '{path}': {e}"
+
+
+@tool
+def write_text_file(path: str, content: str) -> str:
+    """Write text to a .txt file (creating parent folders as needed).
+
+    Accepts known-folder shortcuts, e.g. "desktop/News/summary.txt".
+
+    Args:
+        path: Destination file path.
+        content: The full text to write.
+    """
+    try:
+        target = win.resolve_path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return f"Wrote {len(content)} chars to {target}"
+    except Exception as e:
+        return f"Failed to write file '{path}': {e}"
+
+
+@tool
+def create_document(path: str, content: str, title: str = "") -> str:
+    """Create a document with the given content and save it.
+
+    If ``path`` ends in ``.docx`` a real Word document is produced (requires
+    python-docx); otherwise a ``.txt`` file is written. Accepts known-folder
+    shortcuts, e.g. "desktop/News/Trending News Summary.docx".
+
+    Args:
+        path: Destination file path (.docx or .txt).
+        content: Body text. Blank lines separate paragraphs.
+        title: Optional heading placed at the top of the document.
+    """
+    try:
+        target = win.resolve_path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        if target.suffix.lower() == ".docx":
+            try:
+                from docx import Document
+            except Exception:
+                # Fall back to a .txt sibling if python-docx isn't installed.
+                target = target.with_suffix(".txt")
+                body = (f"{title}\n{'=' * len(title)}\n\n" if title else "") + content
+                target.write_text(body, encoding="utf-8")
+                return f"python-docx missing; wrote text fallback to {target}"
+
+            doc = Document()
+            if title:
+                doc.add_heading(title, level=0)
+            for para in content.split("\n\n"):
+                doc.add_paragraph(para.strip())
+            doc.save(str(target))
+            return f"Created Word document: {target}"
+
+        body = (f"{title}\n{'=' * len(title)}\n\n" if title else "") + content
+        target.write_text(body, encoding="utf-8")
+        return f"Created document: {target}"
+    except Exception as e:
+        return f"Failed to create document '{path}': {e}"
 
 
 @tool
 def run_shell_command(command: str, timeout: int = 30) -> str:
-    """Execute a PowerShell command on Windows 11 and return its output.
+    """Run a PowerShell command and return its output.
 
-    Use this for tasks that are more efficient via command line than GUI
-    interaction. The command runs non-interactively via PowerShell.
-
-    GOOD USE CASES:
-    - Get system information: "systeminfo", "Get-ComputerInfo"
-    - List files: "Get-ChildItem C:\\Users"
-    - Check network: "ipconfig", "ping google.com", "Test-NetConnection"
-    - Manage processes: "Get-Process", "Stop-Process -Name notepad"
-    - Check disk space: "Get-PSDrive C"
-    - Get Windows version: "(Get-WmiObject Win32_OperatingSystem).Caption"
-    - Get IP address: "Get-NetIPAddress"
-    - Check installed software: "Get-WmiObject Win32_Product | Select Name"
-    - Environment variables: "Get-ChildItem Env:"
-    - Create files/folders: "New-Item -Path 'C:\\temp\\test' -ItemType Directory"
-    - Read file content: "Get-Content 'C:\\path\\to\\file.txt'"
-    - Check Windows services: "Get-Service | Where-Object {$_.Status -eq 'Running'}"
-
-    DO NOT USE FOR:
-    - Tasks that require GUI interaction (use mouse/keyboard tools instead).
-    - Commands that require user input or are interactive.
-    - Commands that could damage the system (format, delete system files, etc.).
+    Use for things that are far easier from the command line than the GUI
+    (system info, listing files, network checks). Avoid destructive commands.
 
     Args:
         command: The PowerShell command to execute.
-        timeout: Maximum seconds to wait for completion (default 30, max 120).
-
-    Returns:
-        The command output (stdout and stderr) and exit status.
+        timeout: Max seconds to wait (5–120).
     """
-    # Cap timeout to prevent runaway commands
     safe_timeout = min(max(timeout, 5), 120)
-
     result = _executor.run_shell_command(command, timeout=safe_timeout)
     return f"Shell command: {command}\n{result}"
 
 
+@tool
+def wait(seconds: float = 1.0) -> str:
+    """Pause briefly to let the UI catch up (e.g. an app finishing loading).
+
+    Args:
+        seconds: How long to wait (capped at 10s).
+    """
+    secs = min(max(seconds, 0.0), 10.0)
+    time.sleep(secs)
+    return f"Waited {secs:.1f}s"
+
+
+@tool
+def finish(summary: str) -> str:
+    """Call this ONCE when the user's overall goal is fully accomplished.
+
+    Args:
+        summary: A short summary of what was accomplished.
+    """
+    global _task_finished, _finish_summary
+    _task_finished = True
+    _finish_summary = summary
+    return f"DONE: {summary}"
+
+
 def get_all_tools() -> list[Any]:
-    """Return the list of tools available to the agent."""
-    return [
-        # Mouse actions
+    """Return the tools available to the agent.
+
+    Default (visible-GUI mode): mouse + keyboard + open_application + the
+    read-only read_screen_text, so every artifact is produced by operating the
+    real apps on screen. The silent file/folder/document/shell helpers are added
+    only when ``ENABLE_POWER_TOOLS`` is set.
+    """
+    tools: list[Any] = [
+        # Mouse
         click_element,
         double_click_element,
         right_click_element,
         scroll,
         drag_element,
-        # Keyboard actions
+        # Keyboard
         type_text,
         press_key,
         press_hotkey,
-        # Windows 11 specific
+        # Visible app control + reading
         open_application,
-        run_shell_command,
+        read_screen_text,
+        wait,
+        # Control
+        finish,
     ]
+
+    if settings.ENABLE_POWER_TOOLS:
+        tools.extend([
+            create_folder,
+            write_text_file,
+            create_document,
+            run_shell_command,
+        ])
+
+    return tools
